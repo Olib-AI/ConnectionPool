@@ -1309,6 +1309,18 @@ private struct GamesSelectionSheet: View {
                         dismiss()
                     }
 
+                    // Chess
+                    GameSelectionRow(
+                        title: "Chess",
+                        subtitle: "The classic game of strategy",
+                        icon: "crown.fill",
+                        color: .brown,
+                        players: "2 players"
+                    ) {
+                        viewModel.openGame(.chess)
+                        dismiss()
+                    }
+
                     // Prompt Party
                     GameSelectionRow(
                         title: "Prompt Party",
