@@ -1,0 +1,100 @@
+name: Bug Report
+description: Report a bug in ConnectionPool
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Provide the steps needed to reproduce the issue.
+      placeholder: |
+        1. Configure ConnectionPool with ...
+        2. Call ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happened.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ios-version
+    attributes:
+      label: iOS Version
+      options:
+        - iOS 17.0
+        - iOS 17.1
+        - iOS 17.2
+        - iOS 17.4
+        - iOS 17.5
+        - iOS 17.6
+        - iOS 18.0
+        - iOS 18.1
+        - iOS 18.2
+        - iOS 18.3
+        - iOS 18.4
+        - macOS 14 (Sonoma)
+        - macOS 15 (Sequoia)
+        - Other
+    validations:
+      required: false
+
+  - type: dropdown
+    id: xcode-version
+    attributes:
+      label: Xcode Version
+      options:
+        - Xcode 16.0
+        - Xcode 16.1
+        - Xcode 16.2
+        - Xcode 16.3
+        - Other
+    validations:
+      required: false
+
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: The device where the issue occurs (e.g., iPhone 15, iPad Pro, Mac mini M2).
+      placeholder: iPhone 15 Pro
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Any other context about the problem.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste any relevant console output or crash logs.
+      render: shell
+    validations:
+      required: false
