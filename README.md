@@ -55,90 +55,85 @@ Zero external dependencies. Everything ships in one Swift package.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Host App (SwiftUI)                          │
-│                                                                 │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │
-│  │  Chat ViewModel  │  │  Game ViewModel  │  │  Your Code   │  │
-│  └────────┬─────────┘  └────────┬─────────┘  └──────┬───────┘  │
-│           │                     │                    │          │
-├───────────┼─────────────────────┼────────────────────┼──────────┤
-│           ▼                     ▼                    ▼          │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │              ConnectionPoolManager (@MainActor)            │ │
-│  │                                                            │ │
-│  │  • Hosting / Browsing / Joining                            │ │
-│  │  • MCSession (DTLS .required)                              │ │
-│  │  • Pool code validation                                    │ │
-│  │  • Brute-force & rate-limit protection                     │ │
-│  │  • 10 MB inbound size gate                                 │ │
-│  │  • Combine publishers: messageReceived, peerEvent          │ │
-│  └──────────┬────────────────────────────────┬────────────────┘ │
-│             │                                │                  │
-│             ▼                                ▼                  │
-│  ┌─────────────────────┐          ┌─────────────────────────┐  │
-│  │  MeshRelayService   │          │ MultiplayerGameService  │  │
-│  │                     │          │                         │  │
-│  │  • RelayEnvelope    │          │  • Session management   │  │
-│  │  • HMAC signing     │          │  • Invitations          │  │
-│  │  • BFS routing      │          │  • State sync           │  │
-│  │  • Dedup cache      │          │  • Forfeit / disconnect │  │
-│  │  • Topology bcast   │          └─────────────────────────┘  │
-│  └──────────┬──────────┘                                       │
-│             │                                                   │
-│             ▼                                                   │
-│  ┌─────────────────────┐  ┌─────────────────────────────────┐  │
-│  │   MeshTopology      │  │   DeviceBlockListService        │  │
-│  │                     │  │                                 │  │
-│  │  • Neighbor map     │  │  • Persistent block list        │  │
-│  │  • BFS pathfinding  │  │  • Pluggable storage backend    │  │
-│  │  • Stale pruning    │  │  • Auto-block on brute force    │  │
-│  └─────────────────────┘  └─────────────────────────────────┘  │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              MultipeerConnectivity (Apple)               │   │
-│  │  MCSession / MCNearbyServiceAdvertiser / MCBrowser       │   │
-│  │  DTLS transport encryption • Bonjour discovery           │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph HostApp["Host App - SwiftUI"]
+        ChatVM["Chat ViewModel"]
+        GameVM["Game ViewModel"]
+        YourCode["Your Code"]
+
+        ChatVM --> CPM
+        GameVM --> CPM
+        YourCode --> CPM
+
+        subgraph CPM["ConnectionPoolManager - @MainActor"]
+            direction LR
+            CPM_Features["Hosting / Browsing / Joining\nMCSession DTLS .required\nPool code validation\nBrute-force & rate-limit protection\n10 MB inbound size gate\nCombine publishers: messageReceived, peerEvent"]
+        end
+
+        CPM --> MeshRelay
+        CPM --> GameService
+
+        MeshRelay["MeshRelayService\n\nRelayEnvelope | HMAC signing\nBFS routing | Dedup cache\nTopology broadcast"]
+        GameService["MultiplayerGameService\n\nSession management | Invitations\nState sync | Forfeit / disconnect"]
+
+        MeshRelay --> Topology
+        MeshRelay --> BlockList
+
+        Topology["MeshTopology\n\nNeighbor map | BFS pathfinding\nStale pruning"]
+        BlockList["DeviceBlockListService\n\nPersistent block list\nPluggable storage backend\nAuto-block on brute force"]
+
+        MPC["MultipeerConnectivity - Apple\nMCSession / MCNearbyServiceAdvertiser / MCBrowser\nDTLS transport encryption | Bonjour discovery"]
+    end
+
+    Topology --> MPC
+    BlockList --> MPC
 ```
 
 ### Mesh Message Flow
 
-```
-   Device A                Device B (relay)           Device C
-  ┌────────┐              ┌────────────────┐         ┌────────┐
-  │ Origin │──envelope──▶ │  Verify HMAC   │         │  Dest  │
-  │        │   TTL=5      │  Check dedup   │         │        │
-  │ Sign   │              │  Decrement TTL │         │        │
-  │ HMAC   │              │  Append to hop │──fwd──▶ │ Verify │
-  │        │              │  path          │  TTL=4  │ HMAC   │
-  │        │              │  Forward       │         │ Deliver│
-  └────────┘              └────────────────┘         └────────┘
+```mermaid
+sequenceDiagram
+    participant A as Device A - Origin
+    participant B as Device B - Relay
+    participant C as Device C - Destination
+
+    A->>A: Sign HMAC
+    A->>B: Envelope (TTL=5)
+    B->>B: Verify HMAC
+    B->>B: Check dedup
+    B->>B: Decrement TTL
+    B->>B: Append to hop path
+    B->>C: Forward (TTL=4)
+    C->>C: Verify HMAC
+    C->>C: Deliver message
 ```
 
 ### Remote Relay Flow
 
-```
-   Host (iOS)              StealthRelay (Rust)         Joiner (iOS)
-  ┌────────────┐          ┌──────────────────┐        ┌────────────┐
-  │  HostAuth  │──wss───▶ │  Verify Ed25519  │        │            │
-  │  Ed25519   │          │  Create pool     │        │            │
-  │  signed    │          │  Issue session   │        │            │
-  │            │◀─────────│  token           │        │            │
-  │            │          │                  │        │            │
-  │  Create    │──token──▶│  Generate invite │        │            │
-  │  Invite    │◀─────────│  Ed25519 signed  │        │            │
-  │            │          │  URL             │        │            │
-  │            │          │                  │◀─wss── │ JoinReq    │
-  │            │          │  PoW challenge  ─┼──────▶ │ Solve PoW  │
-  │            │          │                  │◀────── │ Submit     │
-  │            │◀─────────│  Forward to host │        │            │
-  │  Approve   │──token──▶│  Add peer        │──────▶ │ Connected  │
-  │            │          │                  │        │            │
-  │  Forward   │──token──▶│  Relay to peer   │──────▶ │ Receive    │
-  └────────────┘          └──────────────────┘        └────────────┘
+```mermaid
+sequenceDiagram
+    participant Host as Host - iOS
+    participant Relay as StealthRelay - Rust
+    participant Joiner as Joiner - iOS
+
+    Host->>Relay: HostAuth (Ed25519 signed, wss)
+    Relay->>Relay: Verify Ed25519, create pool
+    Relay->>Host: Session token
+
+    Host->>Relay: Create invitation (token)
+    Relay->>Host: Ed25519 signed invite URL
+
+    Joiner->>Relay: JoinRequest (wss)
+    Relay->>Joiner: PoW challenge
+    Joiner->>Relay: PoW solution
+    Relay->>Host: Forward join request
+
+    Host->>Relay: Approve (token)
+    Relay->>Joiner: Connected
+
+    Host->>Relay: Forward (token)
+    Relay->>Joiner: Relayed message
 ```
 
 ## Security
