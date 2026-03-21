@@ -12,23 +12,28 @@ import CryptoKit
 
 /// Thread-safe cache for tracking processed message IDs to prevent loops.
 ///
+/// Uses insertion-ordered tracking for O(1) amortized eviction instead of O(n log n) sort.
+///
 /// SAFETY: @unchecked Sendable is required because:
-/// 1. The class maintains mutable state (seenMessages dictionary)
+/// 1. The class maintains mutable state (seenMessages dictionary, insertionOrder array)
 /// 2. It may be accessed from multiple actors/tasks during relay operations
 /// 3. All mutable state is protected by NSLock for thread-safe access
 final class MessageDeduplicationCache: @unchecked Sendable {
-    
+
     // MARK: - Properties
 
     private let lock = NSLock()
+    /// Maps message ID to its timestamp for expiration checks.
     private var seenMessages: [UUID: Date] = [:]
+    /// Tracks insertion order for O(1) eviction of oldest entries.
+    private var insertionOrder: [UUID] = []
     private let expirationInterval: TimeInterval = 300 // 5 minutes
 
     /// Maximum number of entries allowed in the cache. When exceeded, the oldest entries are evicted.
     private let maxCacheSize: Int = 10_000
-    
+
     // MARK: - Public API
-    
+
     /// Check if message has already been processed.
     /// - Parameter messageID: The message ID to check.
     /// - Returns: `true` if the message has been processed within the expiration window.
@@ -38,40 +43,48 @@ final class MessageDeduplicationCache: @unchecked Sendable {
             // Check if the entry has expired
             if Date().timeIntervalSince(timestamp) > expirationInterval {
                 seenMessages.removeValue(forKey: messageID)
+                // Note: expired entry remains in insertionOrder as a tombstone,
+                // cleaned up during eviction or pruning
                 return false
             }
             return true
         }
     }
-    
+
     /// Mark message as processed.
     ///
-    /// If the cache exceeds `maxCacheSize`, the oldest entries (by timestamp) are evicted
-    /// to keep memory usage bounded.
+    /// If the cache exceeds `maxCacheSize`, the oldest entries are evicted in O(1) amortized
+    /// by removing from the front of the insertion-order queue.
     /// - Parameter messageID: The message ID to mark as processed.
     func markProcessed(_ messageID: UUID) {
         lock.withLock {
-            seenMessages[messageID] = Date()
+            let now = Date()
+            if seenMessages[messageID] == nil {
+                // New entry: add to insertion order
+                insertionOrder.append(messageID)
+            }
+            seenMessages[messageID] = now
 
-            // Evict oldest entries when cache exceeds maximum size
-            if seenMessages.count > maxCacheSize {
-                let sortedByDate = seenMessages.sorted { $0.value < $1.value }
-                let countToRemove = seenMessages.count - maxCacheSize
-                for entry in sortedByDate.prefix(countToRemove) {
-                    seenMessages.removeValue(forKey: entry.key)
-                }
+            // Evict oldest entries when cache exceeds maximum size.
+            // O(1) amortized: remove from the front of the insertion order queue.
+            while seenMessages.count > maxCacheSize, !insertionOrder.isEmpty {
+                let oldest = insertionOrder.removeFirst()
+                // Only remove from dict if it still exists (may have been expired already)
+                seenMessages.removeValue(forKey: oldest)
             }
         }
     }
-    
+
     /// Remove expired entries (called periodically).
     func pruneExpired() {
         let cutoff = Date().addingTimeInterval(-expirationInterval)
         lock.withLock {
             seenMessages = seenMessages.filter { $0.value > cutoff }
+            // Compact the insertion order by removing entries no longer in the dict
+            insertionOrder.removeAll { seenMessages[$0] == nil }
         }
     }
-    
+
     /// Current count of cached message IDs (for diagnostics).
     var count: Int {
         lock.withLock { seenMessages.count }
@@ -101,6 +114,11 @@ public final class MeshRelayService: ObservableObject {
     private let topology: MeshTopology
     private let deduplicationCache: MessageDeduplicationCache
     private let localPeerID: String
+
+    /// Pool-level shared secret for HMAC envelope integrity.
+    /// Must be set before sending/receiving envelopes. Derived from a secret
+    /// established during pool creation/joining — never transmitted on the wire.
+    public var poolSharedSecret: SymmetricKey?
     
     // MARK: - Published State
     
@@ -181,6 +199,7 @@ public final class MeshRelayService: ObservableObject {
     /// Clears the current pool and stops periodic broadcasts.
     public func clearCurrentPool() {
         self.currentPoolID = nil
+        self.poolSharedSecret = nil
         self.lastTopologyTimestamp = [:]
         stopTopologyBroadcastTimer()
     }
@@ -206,7 +225,7 @@ public final class MeshRelayService: ObservableObject {
         // Check if peer is directly reachable
         if topology.canReachDirectly(peerID) {
             // Direct send - no envelope needed, just send the payload
-            log("Sending direct message to peer: \(peerID)", category: .network)
+            log("Sending direct message to peer: \(peerID.prefix(8))...", category: .network)
             
             let message = PoolMessage.relayPayload(
                 from: localPeerID,
@@ -219,18 +238,25 @@ public final class MeshRelayService: ObservableObject {
         
         // Find relay path
         guard let path = topology.findPath(to: peerID) else {
-            log("No path found to peer: \(peerID)", level: .warning, category: .network)
+            log("No path found to peer: \(peerID.prefix(8))...", level: .warning, category: .network)
             deliveryFailed.send((messageID: UUID(), destinationPeerID: peerID))
             return false
         }
         
         guard let firstHop = path.first else {
-            log("Empty path returned for peer: \(peerID)", level: .error, category: .network)
+            log("Empty path returned for peer: \(peerID.prefix(8))...", level: .error, category: .network)
             return false
         }
         
+        // SECURITY: Require a pool-level shared secret for HMAC integrity protection.
+        // Without a shared secret, we cannot produce a valid HMAC and the receiver would reject the envelope.
+        guard let sharedSecret = poolSharedSecret else {
+            log("[SECURITY] Cannot send relay envelope: no pool shared secret set", level: .warning, category: .network)
+            return false
+        }
+
         // Create relay envelope with HMAC integrity protection
-        let hmacKey = RelayEnvelope.deriveHMACKey(from: poolID)
+        let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID)
         let envelope = RelayEnvelope(
             originPeerID: localPeerID,
             destinationPeerID: peerID,
@@ -243,9 +269,9 @@ public final class MeshRelayService: ObservableObject {
         deduplicationCache.markProcessed(envelope.messageID)
 
         // Send to first hop
-        log("Sending relayed message to \(peerID) via \(firstHop), path: \(path)", category: .network)
+        log("Sending relayed message to \(peerID.prefix(8))... via \(firstHop.prefix(8))..., hops: \(path.count)", category: .network)
         sendEnvelopeToNeighbor(envelope, neighborID: firstHop)
-        
+
         return true
     }
     
@@ -258,13 +284,19 @@ public final class MeshRelayService: ObservableObject {
     ///   - payload: The encrypted payload data to broadcast.
     ///   - poolID: The pool ID for the message.
     public func broadcast(_ payload: Data, poolID: UUID) async {
-        guard let poolManager = poolManager else {
+        guard poolManager != nil else {
             log("Cannot broadcast: pool manager not set", level: .warning, category: .network)
             return
         }
         
+        // SECURITY: Require a pool-level shared secret for HMAC integrity protection.
+        guard let sharedSecret = poolSharedSecret else {
+            log("[SECURITY] Cannot broadcast relay envelope: no pool shared secret set", level: .warning, category: .network)
+            return
+        }
+
         // Create broadcast envelope (nil destination) with HMAC integrity protection
-        let hmacKey = RelayEnvelope.deriveHMACKey(from: poolID)
+        let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID)
         let envelope = RelayEnvelope(
             originPeerID: localPeerID,
             destinationPeerID: nil,
@@ -314,20 +346,28 @@ public final class MeshRelayService: ObservableObject {
             return
         }
 
-        // SECURITY FIX: Verify envelope HMAC integrity if present.
-        // If HMAC is present but invalid, the envelope metadata was tampered with — drop it.
-        // If HMAC is absent, accept with a warning for backwards compatibility.
-        let hmacKey = RelayEnvelope.deriveHMACKey(from: currentPoolID)
-        if envelope.hasHMAC {
-            guard envelope.verifyHMAC(using: hmacKey) else {
-                log("[SECURITY] Dropping envelope: HMAC verification failed (tampered metadata). messageID: \(envelope.messageID)",
-                    level: .warning, category: .network)
-                droppedMessageCount += 1
-                return
-            }
-        } else {
-            log("[SECURITY] Received envelope without HMAC (legacy client). messageID: \(envelope.messageID)",
-                level: .debug, category: .network)
+        // SECURITY: Require pool shared secret for HMAC verification.
+        guard let sharedSecret = poolSharedSecret else {
+            log("[SECURITY] Dropping envelope: no pool shared secret set. messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            droppedMessageCount += 1
+            return
+        }
+
+        // SECURITY: ALL envelopes MUST have a valid HMAC. Reject unsigned envelopes.
+        guard envelope.hasHMAC else {
+            log("[SECURITY] Dropping envelope: missing HMAC (unsigned). messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            droppedMessageCount += 1
+            return
+        }
+
+        let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: currentPoolID)
+        guard envelope.verifyHMAC(using: hmacKey) else {
+            log("[SECURITY] Dropping envelope: HMAC verification failed (tampered metadata). messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            droppedMessageCount += 1
+            return
         }
 
         // Check deduplication cache
@@ -352,7 +392,7 @@ public final class MeshRelayService: ObservableObject {
         
         if isForUs {
             // Deliver locally
-            log("Received envelope for local peer, origin: \(envelope.originPeerID)", category: .network)
+            log("Received envelope for local peer, origin: \(envelope.originPeerID.prefix(8))...", category: .network)
             receivedEnvelope.send(envelope)
         }
         
@@ -413,7 +453,7 @@ public final class MeshRelayService: ObservableObject {
         
         // Hop path check - don't relay to peers already in path
         guard !envelope.hopPath.contains(peerID) else {
-            log("Relay blocked: target \(peerID) already in hop path", level: .debug, category: .network)
+            log("Relay blocked: target \(peerID.prefix(8))... already in hop path", level: .debug, category: .network)
             return false
         }
         
@@ -435,12 +475,12 @@ public final class MeshRelayService: ObservableObject {
     public func peerConnected(_ peerID: String) {
         topology.addDirectConnection(peerID)
         let connectTime = Date()
-        log("Peer connected to mesh: \(peerID)", category: .network)
+        log("Peer connected to mesh: \(peerID.prefix(8))...", category: .network)
 
         // Broadcast topology update to neighbors with delay
         // Delay must be AFTER DTLS stabilization (2500ms) to avoid "No route to host" errors
         Task { @MainActor in
-            log("[CALLER_TRACE] MeshRelayService.peerConnected: starting 3500ms delay for topology broadcast (peerID: \(peerID), connected at \(connectTime))", category: .network)
+            log("[CALLER_TRACE] MeshRelayService.peerConnected: starting 3500ms delay for topology broadcast (peerID: \(peerID.prefix(8))..., connected at \(connectTime))", category: .network)
             try? await Task.sleep(for: .milliseconds(3500))
 
             // Verify peer is still connected before broadcasting
@@ -462,7 +502,7 @@ public final class MeshRelayService: ObservableObject {
     public func peerDisconnected(_ peerID: String) {
         topology.removePeer(peerID)
         lastTopologyTimestamp.removeValue(forKey: peerID)
-        log("Peer disconnected from mesh: \(peerID)", category: .network)
+        log("Peer disconnected from mesh: \(peerID.prefix(8))...", category: .network)
         
         // Broadcast topology update to neighbors
         broadcastTopology()
@@ -470,44 +510,61 @@ public final class MeshRelayService: ObservableObject {
     
     /// Update topology from a received broadcast.
     ///
-    /// SECURITY: Validates broadcast freshness before applying:
+    /// SECURITY: Uses `authenticatedSenderID` from the transport layer (PoolMessage.senderID)
+    /// rather than the self-reported `broadcast.peerID` for all routing and rate-limiting decisions.
+    /// This prevents a pool member from poisoning the routing table by claiming to be another peer.
+    ///
+    /// Validates broadcast freshness before applying:
     /// 1. Rejects broadcasts older than `topologyBroadcastMaxAge` (120s) to prevent replay attacks.
     /// 2. Rejects broadcasts with a timestamp older than the last seen from the same peer,
     ///    preventing injection of stale routing information.
     ///
-    /// - Parameter broadcast: The topology broadcast message.
-    public func handleTopologyBroadcast(_ broadcast: TopologyBroadcast) {
+    /// - Parameters:
+    ///   - broadcast: The topology broadcast message.
+    ///   - authenticatedSenderID: The transport-authenticated peer ID of the sender
+    ///     (from PoolMessage.senderID, verified by the MC session delegate).
+    public func handleTopologyBroadcast(_ broadcast: TopologyBroadcast, from authenticatedSenderID: String) {
+        // SECURITY: Detect topology spoofing — the self-reported peerID in the broadcast payload
+        // must match the transport-authenticated sender. If they differ, someone is trying to
+        // inject routing information on behalf of another peer.
+        if broadcast.peerID != authenticatedSenderID {
+            log("[SECURITY] Topology spoofing detected: broadcast claims peerID \(broadcast.peerID.prefix(8))... but authenticated sender is \(authenticatedSenderID.prefix(8)).... Dropping.",
+                level: .warning, category: .network)
+            return
+        }
+
         let now = Date()
         let broadcastAge = now.timeIntervalSince(broadcast.timestamp)
 
         // Reject broadcasts that are too old (stale or replayed)
         if broadcastAge > topologyBroadcastMaxAge {
-            log("[SECURITY] Dropping stale topology broadcast from \(broadcast.peerID): age \(String(format: "%.0f", broadcastAge))s exceeds \(topologyBroadcastMaxAge)s limit",
+            log("[SECURITY] Dropping stale topology broadcast from \(authenticatedSenderID.prefix(8))...: age \(String(format: "%.0f", broadcastAge))s exceeds \(topologyBroadcastMaxAge)s limit",
                 level: .warning, category: .network)
             return
         }
 
         // Reject broadcasts with a future timestamp (clock skew tolerance: 10s)
         if broadcastAge < -10.0 {
-            log("[SECURITY] Dropping topology broadcast from \(broadcast.peerID): timestamp is \(String(format: "%.0f", -broadcastAge))s in the future",
+            log("[SECURITY] Dropping topology broadcast from \(authenticatedSenderID.prefix(8))...: timestamp is \(String(format: "%.0f", -broadcastAge))s in the future",
                 level: .warning, category: .network)
             return
         }
 
         // Reject broadcasts older than the last one we accepted from this peer
-        if let lastTimestamp = lastTopologyTimestamp[broadcast.peerID],
+        // SECURITY: Keyed by authenticatedSenderID, not self-reported broadcast.peerID
+        if let lastTimestamp = lastTopologyTimestamp[authenticatedSenderID],
            broadcast.timestamp <= lastTimestamp {
-            log("[SECURITY] Dropping outdated topology broadcast from \(broadcast.peerID): timestamp \(broadcast.timestamp) <= last seen \(lastTimestamp)",
+            log("[SECURITY] Dropping outdated topology broadcast from \(authenticatedSenderID.prefix(8))...: stale timestamp",
                 level: .debug, category: .network)
             return
         }
 
-        // Accept the broadcast and update tracking
-        lastTopologyTimestamp[broadcast.peerID] = broadcast.timestamp
+        // Accept the broadcast and update tracking using the authenticated sender ID
+        lastTopologyTimestamp[authenticatedSenderID] = broadcast.timestamp
 
         let neighbors = Set(broadcast.directNeighbors)
-        topology.updateNeighbors(for: broadcast.peerID, neighbors: neighbors)
-        log("Updated topology for peer: \(broadcast.peerID), neighbors: \(broadcast.directNeighbors.count)", level: .debug, category: .network)
+        topology.updateNeighbors(for: authenticatedSenderID, neighbors: neighbors)
+        log("Updated topology for peer: \(authenticatedSenderID.prefix(8))..., neighbors: \(broadcast.directNeighbors.count)", level: .debug, category: .network)
     }
     
     /// Broadcast our topology to all direct neighbors.
@@ -543,12 +600,16 @@ public final class MeshRelayService: ObservableObject {
     /// Call this method when receiving `.system` type messages to check if
     /// they contain topology information.
     ///
+    /// SECURITY: Uses `message.senderID` as the transport-authenticated sender identity.
+    /// The `senderID` field in `PoolMessage` is set by the MC session delegate based on
+    /// the transport-level peer identity, not self-reported by the sender in the payload.
+    ///
     /// - Parameter message: The received pool message.
     public func processSystemMessage(_ message: PoolMessage) {
         guard message.type == .system else { return }
 
         if let topologyBroadcast = TopologyBroadcastWrapper.unwrap(message.payload) {
-            handleTopologyBroadcast(topologyBroadcast)
+            handleTopologyBroadcast(topologyBroadcast, from: message.senderID)
         }
     }
     
@@ -589,10 +650,10 @@ public final class MeshRelayService: ObservableObject {
                 if shouldRelay(forwardedEnvelope, to: nextHop) {
                     sendEnvelopeToNeighbor(forwardedEnvelope, neighborID: nextHop)
                     relayedMessageCount += 1
-                    log("Relayed directed message toward \(destination) via \(nextHop)", category: .network)
+                    log("Relayed directed message toward \(destination.prefix(8))... via \(nextHop.prefix(8))...", category: .network)
                 }
             } else {
-                log("No path to destination \(destination), dropping", level: .warning, category: .network)
+                log("No path to destination \(destination.prefix(8))..., dropping", level: .warning, category: .network)
                 droppedMessageCount += 1
             }
         } else {
@@ -629,7 +690,7 @@ public final class MeshRelayService: ObservableObject {
             envelopeData: data
         )
 
-        log("[CALLER_TRACE] MeshRelayService.sendEnvelopeToNeighbor() to \(neighborID)", category: .network)
+        log("[CALLER_TRACE] MeshRelayService.sendEnvelopeToNeighbor() to \(neighborID.prefix(8))...", category: .network)
         poolManager.sendMessage(message, to: [neighborID])
     }
     

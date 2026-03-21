@@ -1,6 +1,6 @@
 # ConnectionPool
 
-**A zero-dependency local P2P mesh networking library for iOS and macOS by [Olib AI](https://www.olib.ai)**
+**A zero-dependency P2P mesh networking library for iOS and macOS with local and remote relay support by [Olib AI](https://www.olib.ai)**
 
 Used in [StealthOS](https://www.stealthos.app) — The privacy-focused operating environment.
 
@@ -13,9 +13,12 @@ Used in [StealthOS](https://www.stealthos.app) — The privacy-focused operating
 
 ## Overview
 
-ConnectionPool is a Swift package that builds a secure mesh network on top of Apple's MultipeerConnectivity framework. It enables local peer-to-peer communication — chat, multiplayer games, and arbitrary data exchange — without any internet connection or external server.
+ConnectionPool is a Swift package that builds a secure mesh network with two transport modes:
 
-Every session enforces DTLS encryption, authenticates joiners with pool codes that are never broadcast over Bonjour, and protects relay envelopes with HMAC-SHA256. The library was built for StealthOS, where "privacy by default" is not a feature — it is the architecture.
+1. **Local mode** — MultipeerConnectivity over Wi-Fi and Bluetooth. No internet required.
+2. **Remote mode** — WebSocket transport via [StealthRelay](https://github.com/Olib-AI/StealthRelay), a self-hosted Rust relay server. Connect from anywhere.
+
+Both modes enforce end-to-end encryption, authenticate joiners with pool codes or invitation tokens, and protect relay envelopes with HMAC-SHA256. The library was built for StealthOS, where "privacy by default" is not a feature — it is the architecture.
 
 Zero external dependencies. Everything ships in one Swift package.
 
@@ -37,6 +40,18 @@ Zero external dependencies. Everything ships in one Swift package.
 - **Configurable logging via protocol injection** — Inject your own `ConnectionPoolLogger` at startup; falls back to Apple's `os.Logger` with per-category subsystems
 - **App lifecycle protocol** — `PoolAppLifecycle` lets the host app suspend, resume, and terminate pool operations cleanly
 - **Zero external dependencies** — Only Apple frameworks: `MultipeerConnectivity`, `CryptoKit`, `Combine`, `Foundation`, `os`
+
+### Remote Relay Transport ([StealthRelay](https://github.com/Olib-AI/StealthRelay))
+
+- **WebSocket transport** — Connect to a self-hosted relay server from anywhere via `ws://` or `wss://`
+- **Ed25519 host authentication** — The host signs pool creation with a Keychain-stored Ed25519 identity
+- **Invitation-based joining** — Shareable `stealth://invite/...` URLs with Ed25519 signatures, HMAC proofs, and configurable expiry
+- **Proof-of-Work anti-DoS** — Joining peers solve a SHA-256 PoW challenge (18-bit difficulty, ~50ms) before the server forwards the request to the host
+- **Session tokens** — All privileged operations (create invitation, kick peer, close pool) require a server-issued session token
+- **TLS certificate pinning** — SPKI SHA-256 pin verification via custom `URLSessionDelegate`
+- **Server claiming** — First-use server binding via QR code or manual claim code from Docker logs
+- **Automatic reconnection** — Exponential backoff with invitation expiry checks; previously-approved peers are auto-accepted on reconnect
+- **Cloudflare Tunnel support** — Production deployment via `cloudflared` for TLS termination without managing certificates
 
 ## Architecture
 
@@ -103,6 +118,29 @@ Zero external dependencies. Everything ships in one Swift package.
   └────────┘              └────────────────┘         └────────┘
 ```
 
+### Remote Relay Flow
+
+```
+   Host (iOS)              StealthRelay (Rust)         Joiner (iOS)
+  ┌────────────┐          ┌──────────────────┐        ┌────────────┐
+  │  HostAuth  │──wss───▶ │  Verify Ed25519  │        │            │
+  │  Ed25519   │          │  Create pool     │        │            │
+  │  signed    │          │  Issue session   │        │            │
+  │            │◀─────────│  token           │        │            │
+  │            │          │                  │        │            │
+  │  Create    │──token──▶│  Generate invite │        │            │
+  │  Invite    │◀─────────│  Ed25519 signed  │        │            │
+  │            │          │  URL             │        │            │
+  │            │          │                  │◀─wss── │ JoinReq    │
+  │            │          │  PoW challenge  ─┼──────▶ │ Solve PoW  │
+  │            │          │                  │◀────── │ Submit     │
+  │            │◀─────────│  Forward to host │        │            │
+  │  Approve   │──token──▶│  Add peer        │──────▶ │ Connected  │
+  │            │          │                  │        │            │
+  │  Forward   │──token──▶│  Relay to peer   │──────▶ │ Receive    │
+  └────────────┘          └──────────────────┘        └────────────┘
+```
+
 ## Security
 
 Security is not bolted on — it is structural. Every layer enforces its own guarantees.
@@ -117,20 +155,33 @@ Pool codes are **never** included in Bonjour discovery metadata. A joiner sends 
 
 ### Brute-Force Protection
 
-Failed join attempts are tracked per device with a 1-hour expiry window. After 5 failures, the device is permanently added to the persistent block list via `DeviceBlockListService`. A separate 5-second per-peer cooldown prevents rapid-fire invitation flooding.
+A global rate limiter tracks total wrong code attempts across all peers — 10 failures in 60 seconds triggers a 30-second cooldown. This cannot be bypassed by rotating peer identities. Per-peer tracking via `DeviceBlockListService` provides supplementary defense.
+
+### Remote Relay Security ([StealthRelay](https://github.com/Olib-AI/StealthRelay))
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Host Authentication** | Ed25519 signature over `pool_id \|\| timestamp` verified by the relay server |
+| **Session Tokens** | 32-byte server-issued token required for all privileged host operations (constant-time comparison) |
+| **Invitation Tokens** | Ed25519-signed URLs with HMAC proof-of-possession, configurable expiry and max uses, `server_address` bound in signature |
+| **Proof-of-Work** | SHA-256 hashcash (18-bit difficulty) required before join requests are forwarded to the host |
+| **TLS Pinning** | SPKI SHA-256 hash pinning via `URLSessionDelegate` (optional, for production deployments) |
+| **Server Claiming** | One-time claim code binds a server to a host identity; the code is destroyed after use |
+| **Display Name Sanitization** | All display names are stripped of control characters, newlines, and truncated to 64 characters before logging or storage |
+| **Per-Pool Isolation** | Pending joins, session tokens, and server URLs are all scoped per-pool — no cross-pool state leakage |
 
 ### Relay Envelope Integrity (HMAC-SHA256)
 
-Every outgoing `RelayEnvelope` is signed with an HMAC computed over its immutable routing fields:
+Every outgoing `RelayEnvelope` is signed with an HMAC computed over its immutable routing fields, each length-prefixed to prevent concatenation forgery:
 
-- `originPeerID`
-- `destinationPeerID`
+- `originPeerID` (length-prefixed)
+- `destinationPeerID` (length-prefixed)
 - `poolID`
 - `messageID`
 - `maxTTL` (constant, not the mutable per-hop TTL)
 - `timestamp`
 
-The HMAC key is derived from the pool UUID using HKDF-SHA256 with a domain-specific salt and info string. Relay nodes that tamper with routing metadata produce an invalid HMAC and the envelope is dropped.
+The HMAC key is derived from a pool-level shared secret (not the pool UUID) using HKDF-SHA256. Verification uses CryptoKit's constant-time `isValidAuthenticationCode`. Envelopes without HMAC are rejected — no backwards-compatibility fallback.
 
 ### Loop and Amplification Prevention
 
@@ -296,11 +347,64 @@ manager.peerEvent
     .store(in: &cancellables)
 ```
 
+### Hosting a Remote Pool
+
+```swift
+import ConnectionPool
+
+let viewModel = ConnectionPoolViewModel()
+
+// Set the relay server URL and create the pool
+viewModel.createRemotePool(serverURL: "10.0.0.4:9090")
+
+// If the server is unclaimed, provide the claim code from Docker logs
+viewModel.claimCode = "abcd-1234-..."
+viewModel.submitClaimCode()
+
+// Create an invitation link for others to join
+viewModel.createRemoteInvitation(maxUses: 1, expiresInSecs: 300)
+
+// The invitation URL is available via currentRemoteInvitation
+if let invitation = viewModel.currentRemoteInvitation {
+    print("Share this link: \(invitation.url)")
+}
+```
+
+### Joining a Remote Pool
+
+```swift
+import ConnectionPool
+
+let viewModel = ConnectionPoolViewModel()
+
+// Join using an invitation URL
+viewModel.invitationURLInput = "stealth://invite/..."
+viewModel.joinViaInvitation()
+```
+
 ### Disconnecting
 
 ```swift
 manager.disconnect()
 ```
+
+## Self-Hosting the Relay Server
+
+The relay server is a standalone Rust project: [StealthRelay](https://github.com/Olib-AI/StealthRelay)
+
+```bash
+# Quick start with Docker
+docker run -p 9090:9090 -p 127.0.0.1:9091:9091 ghcr.io/olib-ai/stealth-relay:latest
+
+# With Docker Compose (recommended)
+docker compose -f docker/docker-compose.yml up -d
+
+# With Cloudflare Tunnel (production)
+docker compose -f docker/docker-compose.yml \
+               -f docker/docker-compose.cloudflared.yml up -d
+```
+
+See the [StealthRelay README](https://github.com/Olib-AI/StealthRelay) for full deployment documentation.
 
 ## Configuration
 
@@ -350,6 +454,9 @@ ConnectionPoolConfiguration.blockListStorageProvider = SecureStorage()
 | `MeshRelayService` | Coordinates multi-hop message routing, topology broadcasts, deduplication, and HMAC verification. |
 | `MultiplayerGameService` | Session management for multiplayer games: invitations, ready checks, state sync, forfeit, disconnect recovery. |
 | `DeviceBlockListService` | Persistent block list with pluggable storage backend. |
+| `WebSocketTransport` | WebSocket-based transport for remote relay mode. Handles HostAuth, JoinRequest, PoW solving, heartbeats, and automatic reconnection. |
+| `RemotePoolService` | Manages host Ed25519 identity (Keychain-stored), invitation creation/parsing, and QR code generation. |
+| `ConnectionPoolViewModel` | SwiftUI-ready view model bridging both local and remote transport modes. |
 
 ### Models
 
@@ -364,6 +471,12 @@ ConnectionPoolConfiguration.blockListStorageProvider = SecureStorage()
 | `MeshTopology` | Thread-safe (NSLock) distributed neighbor map with BFS shortest-path routing. |
 | `TopologyBroadcast` | Payload for sharing a peer's direct neighbors with the mesh. |
 | `PoolUserProfile` | User-facing profile: display name, avatar emoji, color index. |
+| `RemotePoolConfiguration` | Settings for remote relay connections: server URL, pool name, max peers, heartbeat interval, SPKI pin hash. |
+| `RemotePoolState` | Persisted state for remote pool connections (server URL, pool ID, claim status). |
+| `RemoteInvitation` | An active invitation with token ID, shareable URL, expiry, and max uses. |
+| `ParsedInvitation` | Decoded invitation URL fields: pool ID, token secret, server address, host fingerprint. |
+| `RemoteHostIdentity` | Ed25519 signing identity for the pool host (Keychain-stored private key). |
+| `ServerFrame` | All WebSocket frame types for client-server communication (HostAuth, Forward, JoinRequest, etc.). |
 | `BlockedDevice` | A blocked device entry with peer ID, display name, reason, and timestamp. |
 
 ### Protocols
@@ -434,8 +547,9 @@ SOFTWARE.
 ## Credits
 
 - [Olib AI](https://www.olib.ai) — Package maintainer and [StealthOS](https://www.stealthos.app) developer
-- [Apple MultipeerConnectivity](https://developer.apple.com/documentation/multipeerconnectivity) — Transport layer
-- [Apple CryptoKit](https://developer.apple.com/documentation/cryptokit) — HMAC-SHA256 and HKDF key derivation
+- [StealthRelay](https://github.com/Olib-AI/StealthRelay) — Self-hosted Rust relay server for remote pool connections
+- [Apple MultipeerConnectivity](https://developer.apple.com/documentation/multipeerconnectivity) — Local transport layer
+- [Apple CryptoKit](https://developer.apple.com/documentation/cryptokit) — HMAC-SHA256, HKDF key derivation, Ed25519 signing
 
 ## Contributing
 

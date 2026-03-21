@@ -179,7 +179,7 @@ public final class MultiplayerGameService: ObservableObject {
             additionalData: invitation
         ) {
             poolManager.sendMessage(message, to: [peerID])
-            log("Sent game invitation to \(peerID)", category: .games)
+            log("Sent game invitation to \(peerID.prefix(8))...", category: .games)
         }
     }
 
@@ -372,7 +372,7 @@ public final class MultiplayerGameService: ObservableObject {
 
     /// Send a game action to other players
     public func sendGameAction<T: Encodable>(_ action: T) {
-        guard let session = currentSession,
+        guard currentSession != nil,
               let poolManager = poolManager else { return }
 
         // Guard against sending when not in a connected state
@@ -393,7 +393,7 @@ public final class MultiplayerGameService: ObservableObject {
 
     /// Send current game state for synchronization
     public func sendGameState<T: Encodable>(_ state: T) {
-        guard let session = currentSession,
+        guard currentSession != nil,
               let poolManager = poolManager else { return }
 
         // Guard against sending when not in a connected state
@@ -444,7 +444,7 @@ public final class MultiplayerGameService: ObservableObject {
         }
 
         // End game with us as loser
-        let myIndex = session.players.firstIndex(where: { $0.id == poolManager.localPeerID })
+        let _ = session.players.firstIndex(where: { $0.id == poolManager.localPeerID })
         let winnerIndex = session.players.first(where: { $0.id != poolManager.localPeerID })?.playerIndex
         endGame(winnerIndex: winnerIndex)
     }
@@ -546,10 +546,15 @@ public final class MultiplayerGameService: ObservableObject {
     private func handleGameActionMessage(_ message: PoolMessage) {
         guard let session = currentSession else { return }
 
-        // Find player index for sender
-        if let playerIndex = session.players.first(where: { $0.id == message.senderID })?.playerIndex {
-            gameActionReceived.send((action: message.payload, playerIndex: playerIndex))
+        // SECURITY: Use transport-authenticated senderID (message.senderID) for player lookup.
+        // This is the peer ID from the transport layer, not a self-reported field in the payload.
+        // This prevents players from impersonating other players by crafting malicious payloads.
+        guard let playerIndex = session.players.first(where: { $0.id == message.senderID })?.playerIndex else {
+            log("[SECURITY] Received game action from unknown player \(message.senderID.prefix(8))..., dropping",
+                level: .warning, category: .games)
+            return
         }
+        gameActionReceived.send((action: message.payload, playerIndex: playerIndex))
     }
 
     private func handleGameControl(_ control: GameControlPayload, from senderID: String, senderName: String) {
@@ -566,21 +571,37 @@ public final class MultiplayerGameService: ObservableObject {
             }
 
         case .sessionUpdate:
-            if let session = control.decodeData(as: MultiplayerGameSession.self) {
-                currentSession = session
-                sessionUpdated.send(session)
+            // SECURITY: Only the host can send authoritative session updates.
+            // Use the transport-authenticated senderID (not self-reported) to verify.
+            guard let session = currentSession else { break }
+            guard senderID == session.hostPeerID else {
+                log("[SECURITY] Rejecting sessionUpdate from non-host peer \(senderID.prefix(8))... (host is \(session.hostPeerID.prefix(8))...)",
+                    level: .warning, category: .games)
+                break
+            }
+            if let updatedSession = control.decodeData(as: MultiplayerGameSession.self) {
+                currentSession = updatedSession
+                sessionUpdated.send(updatedSession)
             }
 
         case .start:
-            if let session = control.decodeData(as: MultiplayerGameSession.self) {
-                currentSession = session
+            // SECURITY: Only the host can start the game.
+            guard let session = currentSession else { break }
+            guard senderID == session.hostPeerID else {
+                log("[SECURITY] Rejecting start command from non-host peer \(senderID.prefix(8))... (host is \(session.hostPeerID.prefix(8))...)",
+                    level: .warning, category: .games)
+                break
+            }
+            if let startedSession = control.decodeData(as: MultiplayerGameSession.self) {
+                currentSession = startedSession
                 isGameActive = true
-                gameStarted.send(session)
+                gameStarted.send(startedSession)
                 log("Game started by host", category: .games)
             }
 
         case .ready:
-            // Handle ready status update
+            // Handle ready status update.
+            // Use transport-authenticated senderID for player lookup instead of self-reported data.
             if var session = currentSession {
                 if let playerIndex = session.players.firstIndex(where: { $0.id == senderID }) {
                     session.players[playerIndex].isReady = true
@@ -593,6 +614,7 @@ public final class MultiplayerGameService: ObservableObject {
             }
 
         case .forfeit:
+            // Use transport-authenticated senderID for player lookup.
             if let session = currentSession,
                let player = session.players.first(where: { $0.id == senderID }) {
                 playerForfeited.send(player)
@@ -602,7 +624,6 @@ public final class MultiplayerGameService: ObservableObject {
             }
 
         case .pause, .resume, .rematch:
-            // TODO: Implement if needed
             break
         }
     }

@@ -59,6 +59,48 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Publisher for peer connection events
     public let peerEvent = PassthroughSubject<PeerEvent, Never>()
 
+    // MARK: - Remote Transport Bridge
+
+    /// When set, messages are sent via WebSocket instead of MultipeerConnectivity.
+    /// PoolChat and games call `sendMessage()` which checks this first.
+    public var remoteTransport: WebSocketTransport? {
+        didSet {
+            if remoteTransport != nil {
+                log("Remote transport bridge activated", category: .network)
+            }
+        }
+    }
+
+    /// Add a remote peer to the connected peers list.
+    /// Called by the ViewModel when a peer connects via WebSocket.
+    public func addRemotePeer(_ peer: Peer) {
+        if !connectedPeers.contains(where: { $0.id == peer.id }) {
+            connectedPeers.append(peer)
+            peerEvent.send(.connected(peer))
+        }
+    }
+
+    /// Remove a remote peer from the connected peers list.
+    public func removeRemotePeer(_ peerID: String) {
+        if let peer = connectedPeers.first(where: { $0.id == peerID }) {
+            connectedPeers.removeAll { $0.id == peerID }
+            peerEvent.send(.disconnected(peer))
+        }
+    }
+
+    /// Inject a message received via WebSocket into the message pipeline.
+    /// This makes PoolChat and games see it as if it arrived via MC.
+    public func injectReceivedMessage(_ message: PoolMessage) {
+        messageReceived.send(message)
+    }
+
+    /// Set remote pool state so games/chat see the pool as active.
+    public func setRemotePoolState(poolState: PoolState, session: PoolSession?, isHost: Bool) {
+        self.poolState = poolState
+        self.currentSession = session
+        self.isHost = isHost
+    }
+
     // MARK: - Private Properties
 
     private var peerID: MCPeerID?
@@ -72,21 +114,27 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Map MCPeerID to our Peer model
     private var peerIDMap: [MCPeerID: String] = [:]
 
+    /// Map discovered/pending peer string IDs back to their MCPeerID objects.
+    /// Uses stable generated IDs (not display names) so lookups are secure.
+    private var discoveredMCPeers: [String: MCPeerID] = [:]
+
     /// Track when each peer connected for DTLS stabilization checks
     private var peerConnectionTimes: [String: Date] = [:]
 
-    /// Track failed join attempt counts per peer, persisted to UserDefaults with expiry.
-    /// Each entry stores the count and the timestamp of the last failed attempt.
+    /// Track failed join attempt counts per peer display name (supplementary defense only).
+    /// SECURITY NOTE: These are keyed by attacker-controlled display names and can be bypassed
+    /// by rotating MCPeerID. The global rate limiter is the primary brute-force defense.
+    /// Per-peer counts are retained only for supplementary block-list functionality against casual abuse.
     private var failedAttemptCounts: [String: Int] = [:]
 
     /// Backing timestamps for failed attempt expiry (when each peer's count was last updated)
     private var failedAttemptTimestamps: [String: Date] = [:]
 
-    /// Number of failed attempts before auto-blocking a device
+    /// Number of failed attempts before auto-blocking a device (supplementary defense only)
     private static let maxFailedAttempts = 5
 
-    /// UserDefaults key for persisted failed attempt counts
-    private static let failedAttemptCountsKey = "com.stealthos.pool.failedAttemptCounts"
+    /// File name for persisted failed attempt counts (stored in Application Support with file protection)
+    private static let failedAttemptCountsFileName = "com.stealthos.pool.failedAttemptCounts.json"
 
     /// Failed attempt counts older than this are expired and discarded (1 hour)
     private static let failedAttemptExpiry: TimeInterval = 3600
@@ -98,7 +146,8 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     private var delayedTasks: [Task<Void, Never>] = []
 
     /// Per-peer cooldown: tracks the last connection attempt timestamp per peer display name.
-    /// Used to rate-limit invitation processing (5-second cooldown between attempts).
+    /// SECURITY NOTE: Keyed by attacker-controlled display name. This is a supplementary
+    /// defense against casual abuse only. The global rate limiter is the primary defense.
     private var lastAttemptTime: [String: Date] = [:]
 
     /// Minimum interval between connection attempts from the same peer (seconds)
@@ -107,8 +156,75 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Entries older than this are pruned from lastAttemptTime on each new attempt (seconds)
     private static let attemptTimestampExpiry: TimeInterval = 60.0
 
+    // MARK: - Global Rate Limit (brute-force defense across all peers)
+
+    /// Total failed pool code attempts across all peers within the current window.
+    /// This prevents attackers from bypassing per-displayName rate limits by changing their MCPeerID.
+    private var globalFailedAttemptCount: Int = 0
+
+    /// Timestamp when the global failed attempt counter was last reset.
+    private var lastGlobalAttemptReset: Date = Date()
+
+    /// Maximum total failed code attempts from any peers within the global window before locking out.
+    private static let globalMaxFailedAttempts: Int = 10
+
+    /// Time window for counting global failed attempts (seconds).
+    private static let globalFailedAttemptWindow: TimeInterval = 60.0
+
+    /// Duration to reject all code attempts after global limit is hit (seconds).
+    private static let globalCooldownDuration: TimeInterval = 30.0
+
+    /// Whether the pool is currently in global cooldown (all code attempts rejected).
+    private var globalCooldownUntil: Date?
+
+    /// Check and update the global rate limit. Returns `true` if the attempt should be rejected.
+    /// Call this before per-peer checks when a wrong pool code is provided.
+    private func shouldRejectGlobally() -> Bool {
+        let now = Date()
+
+        // If in active cooldown, reject
+        if let cooldownEnd = globalCooldownUntil, now < cooldownEnd {
+            return true
+        } else if globalCooldownUntil != nil {
+            // Cooldown expired, reset
+            globalCooldownUntil = nil
+            globalFailedAttemptCount = 0
+            lastGlobalAttemptReset = now
+        }
+
+        // Reset counter if the window has elapsed
+        if now.timeIntervalSince(lastGlobalAttemptReset) >= Self.globalFailedAttemptWindow {
+            globalFailedAttemptCount = 0
+            lastGlobalAttemptReset = now
+        }
+
+        return false
+    }
+
+    /// Record a global failed attempt. If the threshold is exceeded, activate cooldown.
+    private func recordGlobalFailedAttempt() {
+        let now = Date()
+
+        // Reset counter if window elapsed
+        if now.timeIntervalSince(lastGlobalAttemptReset) >= Self.globalFailedAttemptWindow {
+            globalFailedAttemptCount = 0
+            lastGlobalAttemptReset = now
+        }
+
+        globalFailedAttemptCount += 1
+
+        if globalFailedAttemptCount >= Self.globalMaxFailedAttempts {
+            globalCooldownUntil = now.addingTimeInterval(Self.globalCooldownDuration)
+            log("[SECURITY] Global rate limit triggered: \(globalFailedAttemptCount) failed code attempts in \(Self.globalFailedAttemptWindow)s. Rejecting all attempts for \(Self.globalCooldownDuration)s.",
+                level: .warning, category: .network)
+        }
+    }
+
     /// Minimum delay after connection before DTLS is considered stable (milliseconds)
     private static let dtlsStabilizationDelay: Double = 2500
+
+    /// Maximum allowed length for user display names (enforced on load and update)
+    private static let maxDisplayNameLength: Int = 128
 
     // MARK: - Relay Advertising Properties
 
@@ -158,10 +274,10 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     }
 
     private func setupPeerID() {
-        // Use device name or generate a unique name
-        // NOTE: On macOS, Host.current().localizedName performs a synchronous reverse DNS lookup
-        // that can block for 5-6 seconds if DNS is slow or fails. We use ProcessInfo.hostName
-        // as the primary source which is faster and doesn't do reverse DNS.
+        // Use device name or generate a unique name.
+        // PERF FIX: Avoid Host.current().localizedName entirely — it performs a synchronous
+        // reverse DNS lookup that can block for 5-6 seconds on the main thread.
+        // ProcessInfo.hostName is fast (no DNS) and sufficient for peer identification.
         #if canImport(UIKit)
         let displayName = UIDevice.current.name
         #else
@@ -170,8 +286,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         if !hostName.isEmpty && hostName != "localhost" {
             displayName = hostName
         } else {
-            // Last resort: use Host.current() which may block on DNS
-            displayName = Host.current().localizedName ?? "Mac User"
+            displayName = "Mac User"
         }
         #endif
         self.peerID = MCPeerID(displayName: displayName)
@@ -184,7 +299,12 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // Try to load from UserDefaults first (synchronous)
         if let data = defaults.data(forKey: key),
-           let savedProfile = try? JSONDecoder().decode(PoolUserProfile.self, from: data) {
+           var savedProfile = try? JSONDecoder().decode(PoolUserProfile.self, from: data) {
+            // SECURITY: Cap display name length to prevent oversized names from being
+            // broadcast to peers or used in relay validation bypass.
+            if savedProfile.displayName.count > Self.maxDisplayNameLength {
+                savedProfile.displayName = String(savedProfile.displayName.prefix(Self.maxDisplayNameLength))
+            }
             self.localProfile = savedProfile
             log("Loaded user profile from UserDefaults: \(savedProfile.displayName), emoji: \(savedProfile.avatarEmoji), color: \(savedProfile.avatarColorIndex)", category: .network)
         } else {
@@ -214,9 +334,30 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         let lastUpdated: Date
     }
 
-    /// Load persisted failed attempt counts from UserDefaults, discarding expired entries.
+    /// Returns the URL for the protected failed attempt counts file in Application Support.
+    /// The directory is created if it doesn't exist, with `NSFileProtectionComplete` applied.
+    private static var failedAttemptCountsFileURL: URL? {
+        guard let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directoryURL = appSupportURL.appendingPathComponent("ConnectionPool", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: directoryURL.path) {
+            do {
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: [
+                    .protectionKey: FileProtectionType.complete
+                ])
+            } catch {
+                return nil
+            }
+        }
+        return directoryURL.appendingPathComponent(failedAttemptCountsFileName)
+    }
+
+    /// Load persisted failed attempt counts from a protected file, discarding expired entries.
     private func loadFailedAttemptCounts() {
-        guard let data = UserDefaults.standard.data(forKey: Self.failedAttemptCountsKey),
+        guard let fileURL = Self.failedAttemptCountsFileURL,
+              FileManager.default.fileExists(atPath: fileURL.path),
+              let data = try? Data(contentsOf: fileURL),
               let entries = try? JSONDecoder().decode([String: PersistedFailedAttempt].self, from: data) else {
             return
         }
@@ -234,11 +375,16 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         failedAttemptCounts = loadedCounts
         failedAttemptTimestamps = loadedTimestamps
-        log("Loaded \(loadedCounts.count) persisted failed attempt counter(s) from UserDefaults", category: .network)
+        log("Loaded \(loadedCounts.count) persisted failed attempt counter(s) from protected storage", category: .network)
     }
 
-    /// Persist current failed attempt counts to UserDefaults.
+    /// Persist current failed attempt counts to a protected file in Application Support.
     private func saveFailedAttemptCounts() {
+        guard let fileURL = Self.failedAttemptCountsFileURL else {
+            log("Failed to resolve protected storage path for failed attempt counts", level: .error, category: .network)
+            return
+        }
+
         var entries: [String: PersistedFailedAttempt] = [:]
         let now = Date()
 
@@ -251,7 +397,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         do {
             let data = try JSONEncoder().encode(entries)
-            UserDefaults.standard.set(data, forKey: Self.failedAttemptCountsKey)
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtection])
         } catch {
             log("Failed to save failed attempt counts: \(error)", level: .error, category: .network)
         }
@@ -279,7 +425,12 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Update local profile and broadcast to connected peers
     public func updateProfile(_ profile: PoolUserProfile) {
-        localProfile = profile
+        var sanitizedProfile = profile
+        // SECURITY: Enforce display name length cap to prevent oversized names
+        if sanitizedProfile.displayName.count > Self.maxDisplayNameLength {
+            sanitizedProfile.displayName = String(sanitizedProfile.displayName.prefix(Self.maxDisplayNameLength))
+        }
+        localProfile = sanitizedProfile
         saveProfile()
         broadcastProfile()
     }
@@ -470,9 +621,9 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
             return
         }
 
-        // Find the MCPeerID for this discovered peer
-        guard let mcPeerID = peerIDMap.first(where: { $0.value == peer.id })?.key else {
-            log("Cannot find MCPeerID for peer: \(peer.id)", category: .network)
+        // Find the MCPeerID for this discovered peer via the stable ID map
+        guard let mcPeerID = discoveredMCPeers[peer.id] ?? peerIDMap.first(where: { $0.value == peer.id })?.key else {
+            log("Cannot find MCPeerID for peer: \(peer.id.prefix(8))...", category: .network)
             return
         }
 
@@ -557,6 +708,13 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Send a message to all connected peers (primary session + relay session)
     public func sendMessage(_ message: PoolMessage) {
+        // If remote transport is active, send via WebSocket instead of MC.
+        if let remote = remoteTransport {
+            guard let data = message.encode() else { return }
+            remote.broadcast(data, reliable: message.isReliable)
+            return
+        }
+
         // DIAGNOSTIC: Log ALL sendMessage calls with timestamp to identify DTLS error causes
         let timestamp = Date()
         let timeSinceEpoch = timestamp.timeIntervalSince1970
@@ -612,10 +770,17 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Send a message to specific peers (checks both primary and relay sessions)
     public func sendMessage(_ message: PoolMessage, to peerIDs: [String]) {
+        // If remote transport is active, send via WebSocket instead of MC.
+        if let remote = remoteTransport {
+            guard let data = message.encode() else { return }
+            remote.send(data, to: peerIDs, reliable: message.isReliable)
+            return
+        }
+
         // DIAGNOSTIC: Log ALL sendMessage calls with timestamp to identify DTLS error causes
         let timestamp = Date()
         let timeSinceEpoch = timestamp.timeIntervalSince1970
-        log("[SEND_TRACE] sendMessage(targeted) type=\(message.type.rawValue) to=\(peerIDs) at \(timestamp) (epoch: \(String(format: "%.3f", timeSinceEpoch)))", category: .network)
+        log("[SEND_TRACE] sendMessage(targeted) type=\(message.type.rawValue) to=\(peerIDs.count) peer(s) at \(timestamp) (epoch: \(String(format: "%.3f", timeSinceEpoch)))", category: .network)
 
         guard let data = message.encode() else {
             log("Failed to encode message", category: .network)
@@ -684,7 +849,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         }
 
         if sentToPrimary == 0 && sentToRelay == 0 {
-            log("No matching reachable peers found for targeted message delivery to \(peerIDs)", level: .warning, category: .network)
+            log("No matching reachable peers found for targeted message delivery to \(peerIDs.count) peer(s)", level: .warning, category: .network)
         }
     }
 
@@ -772,6 +937,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         currentSession = nil
         isHost = false
         peerIDMap = [:]
+        discoveredMCPeers = [:]
         peerConnectionTimes = [:]
         pendingInvitations = [:]
         // NOTE: failedAttemptCounts is intentionally NOT cleared on disconnect.
@@ -806,9 +972,12 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         localProfile.displayName
     }
 
+    /// Override for remote mode peer ID.
+    public var remotePeerID: String?
+
     /// Get the local peer's ID
     public var localPeerID: String {
-        peerID?.displayName ?? ""
+        remotePeerID ?? peerID?.displayName ?? ""
     }
 
     // MARK: - Device Blocking
@@ -1244,7 +1413,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
                 // Note: joiners do not store the pool code -- only the host has it
             )
 
-            log("[RELAY_SESSION] Created PoolSession for relay joiner: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID)", category: .network)
+            log("[RELAY_SESSION] Created PoolSession for relay joiner: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
             joiningPeer = nil
         }
 
@@ -1391,7 +1560,7 @@ extension ConnectionPoolManager: MCSessionDelegate {
                             // Note: joiners do not store the pool code -- only the host has it
                         )
 
-                        log("Created PoolSession for non-host peer: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID)", category: .network)
+                        log("Created PoolSession for non-host peer: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
 
                         // Clear the joining peer reference
                         joiningPeer = nil
@@ -1543,19 +1712,22 @@ extension ConnectionPoolManager: MCNearbyServiceAdvertiserDelegate {
         let handler = UncheckedSendableBox(invitationHandler)
 
         Task { @MainActor [capturedPeerID] in
-            // SECURITY: Per-peer rate limiting — reject if this peer attempted within the cooldown window.
-            // Prune old entries (older than 60s) on each new attempt to prevent unbounded growth.
-            let now = Date()
-            let expiryCutoff = now.addingTimeInterval(-Self.attemptTimestampExpiry)
-            self.lastAttemptTime = self.lastAttemptTime.filter { $0.value > expiryCutoff }
-
-            if let lastTime = self.lastAttemptTime[peerDisplayName],
-               now.timeIntervalSince(lastTime) < Self.attemptCooldownInterval {
-                log("[SECURITY] Rate-limiting invitation from \(peerDisplayName): attempted \(String(format: "%.1f", now.timeIntervalSince(lastTime)))s ago (cooldown: \(Self.attemptCooldownInterval)s)",
+            // SECURITY: Global rate limit is the PRIMARY brute-force defense.
+            // This cannot be bypassed by rotating MCPeerID display names.
+            if self.shouldRejectGlobally() {
+                log("[SECURITY] Global rate limit active: rejecting invitation from \(peerDisplayName). All code attempts blocked until cooldown expires.",
                     level: .warning, category: .network)
                 handler.value(false, nil as MCSession?)
                 return
             }
+
+            // SECURITY NOTE: Per-peer cooldown is keyed by attacker-controlled displayName.
+            // It is supplementary only — an attacker can bypass it by rotating display names,
+            // or use a victim's display name to denial-of-service them. The global rate limiter
+            // above is the authoritative defense. We still track per-peer timestamps for logging.
+            let now = Date()
+            let expiryCutoff = now.addingTimeInterval(-Self.attemptTimestampExpiry)
+            self.lastAttemptTime = self.lastAttemptTime.filter { $0.value > expiryCutoff }
             self.lastAttemptTime[peerDisplayName] = now
 
             // Determine if this invitation came via the relay advertiser
@@ -1585,7 +1757,10 @@ extension ConnectionPoolManager: MCNearbyServiceAdvertiserDelegate {
                         log("[RELAY_ADV] Rejecting relay invitation: invalid pool code from \(peerDisplayName)", category: .network)
                         handler.value(false, nil as MCSession?)
 
-                        // Track failed code attempts for brute-force protection
+                        // Track global failed attempts (primary brute-force defense)
+                        self.recordGlobalFailedAttempt()
+
+                        // Track per-peer failed code attempts (secondary defense)
                         let count = self.incrementFailedAttemptCount(for: peerDisplayName)
                         log("Failed code attempt count for \(peerDisplayName): \(count)/\(Self.maxFailedAttempts)", category: .network)
                         if count >= Self.maxFailedAttempts {
@@ -1637,7 +1812,10 @@ extension ConnectionPoolManager: MCNearbyServiceAdvertiserDelegate {
                     log("Rejecting invitation: invalid pool code from \(peerDisplayName)", category: .network)
                     handler.value(false, nil as MCSession?)
 
-                    // Track failed code attempts for brute-force protection
+                    // Track global failed attempts (primary brute-force defense)
+                    self.recordGlobalFailedAttempt()
+
+                    // Track per-peer failed code attempts (secondary defense)
                     let count = self.incrementFailedAttemptCount(for: peerDisplayName)
                     log("Failed code attempt count for \(peerDisplayName): \(count)/\(Self.maxFailedAttempts)", category: .network)
                     if count >= Self.maxFailedAttempts {
@@ -1680,9 +1858,13 @@ extension ConnectionPoolManager: MCNearbyServiceAdvertiserDelegate {
                 // Store for manual handling
                 pendingInvitations[capturedPeerID] = handler.value
 
+                // Use a stable generated ID (not display name) for the peer
+                let stableID = UUID().uuidString
+                self.discoveredMCPeers[stableID] = capturedPeerID
+
                 // Publish event for UI to handle
                 let peer = DiscoveredPeer(
-                    id: peerDisplayName,
+                    id: stableID,
                     displayName: peerDisplayName
                 )
                 peerEvent.send(.invitationReceived(peer))
@@ -1716,30 +1898,32 @@ extension ConnectionPoolManager: MCNearbyServiceAdvertiserDelegate {
 
     /// Accept a pending invitation
     public func acceptInvitation(from peerID: String) {
-        guard let mcPeerID = peerIDMap.first(where: { $0.value == peerID })?.key ?? pendingInvitations.keys.first(where: { $0.displayName == peerID }),
+        // Look up MCPeerID via the stable ID map (primary), then fall back to peerIDMap
+        guard let mcPeerID = discoveredMCPeers[peerID] ?? peerIDMap.first(where: { $0.value == peerID })?.key,
               let handler = pendingInvitations[mcPeerID] else {
-            log("No pending invitation from: \(peerID)", category: .network)
+            log("No pending invitation from: \(peerID.prefix(8))...", category: .network)
             return
         }
 
         handler(true, session)
         pendingInvitations.removeValue(forKey: mcPeerID)
-        // Reset failed attempts on successful join
-        clearFailedAttemptCount(for: peerID)
-        log("Accepted invitation from: \(peerID)", category: .network)
+        discoveredMCPeers.removeValue(forKey: peerID)
+        clearFailedAttemptCount(for: mcPeerID.displayName)
+        log("Accepted invitation from: \(peerID.prefix(8))...", category: .network)
     }
 
     /// Reject a pending invitation
     public func rejectInvitation(from peerID: String) {
-        guard let mcPeerID = peerIDMap.first(where: { $0.value == peerID })?.key ?? pendingInvitations.keys.first(where: { $0.displayName == peerID }),
+        guard let mcPeerID = discoveredMCPeers[peerID] ?? peerIDMap.first(where: { $0.value == peerID })?.key,
               let handler = pendingInvitations[mcPeerID] else {
-            log("No pending invitation from: \(peerID)", category: .network)
+            log("No pending invitation from: \(peerID.prefix(8))...", category: .network)
             return
         }
 
         handler(false, nil)
         pendingInvitations.removeValue(forKey: mcPeerID)
-        log("Rejected invitation from: \(peerID)", category: .network)
+        discoveredMCPeers.removeValue(forKey: peerID)
+        log("Rejected invitation from: \(peerID.prefix(8))...", category: .network)
 
         // Increment failed attempt counter (manual rejection counts)
         let count = incrementFailedAttemptCount(for: peerID)
@@ -1821,8 +2005,13 @@ extension ConnectionPoolManager: MCNearbyServiceBrowserDelegate {
                 discoveredPoolIDs.insert(poolID)
             }
 
-            // Also skip if we already have this exact peer
-            guard !discoveredPeers.contains(where: { $0.id == peerDisplayName }) else {
+            // Use a stable generated ID (not display name) for the peer
+            let stableID = UUID().uuidString
+            self.discoveredMCPeers[stableID] = capturedPeerID
+
+            // Skip if we already have this exact MC peer (by MCPeerID object)
+            guard !self.discoveredMCPeers.values.contains(where: { $0 == capturedPeerID && self.discoveredMCPeers.first(where: { $0.value == capturedPeerID })?.key != stableID }) else {
+                self.discoveredMCPeers.removeValue(forKey: stableID)
                 log("Skipping already discovered peer: \(peerDisplayName)", level: .debug, category: .network)
                 return
             }
@@ -1834,7 +2023,7 @@ extension ConnectionPoolManager: MCNearbyServiceBrowserDelegate {
             }
 
             let peer = DiscoveredPeer(
-                id: peerDisplayName,
+                id: stableID,
                 displayName: poolName,
                 hasPoolCode: hasPoolCode,
                 hostProfile: hostProfile,

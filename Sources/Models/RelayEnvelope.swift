@@ -154,6 +154,11 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
         var newHopPath = hopPath
         newHopPath.append(relayPeerID)
 
+        // SECURITY: Cap hop path to maxTTL + 1 entries. An envelope created with maxTTL
+        // hops should have at most maxTTL + 1 entries in the hop path (origin + relays).
+        // Envelopes exceeding this limit are considered suspicious and rejected.
+        guard newHopPath.count <= Self.maxTTL + 1 else { return nil }
+
         // NOTE: The HMAC is preserved from the original envelope. It covers immutable
         // fields (origin, destination, poolID, messageID, original ttl, timestamp).
         // The hop path and current ttl are mutable relay metadata and are NOT covered
@@ -270,26 +275,36 @@ extension RelayEnvelope {
 
 extension RelayEnvelope {
 
-    /// Derives an HMAC signing key from a pool ID using HKDF.
+    /// Derives an HMAC signing key from a pool-level shared secret and pool ID using HKDF.
     ///
-    /// All members of the same pool can derive this key from the pool ID,
-    /// allowing them to verify envelope integrity. Outsiders who do not know
-    /// the pool ID cannot forge valid HMACs.
+    /// The shared secret is established during pool creation/joining and is never transmitted
+    /// in plaintext. The pool ID is included as salt to bind the derived key to this specific pool.
+    /// Observers who see the pool ID on the wire cannot forge HMACs without the shared secret.
     ///
-    /// - Parameter poolID: The pool UUID used as input keying material.
+    /// - Parameters:
+    ///   - sharedSecret: The pool-level shared secret (established during pool creation/joining).
+    ///   - poolID: The pool UUID used as salt for domain separation.
     /// - Returns: A `SymmetricKey` suitable for HMAC-SHA256 operations.
-    public static func deriveHMACKey(from poolID: UUID) -> SymmetricKey {
+    public static func deriveHMACKey(from sharedSecret: SymmetricKey, poolID: UUID) -> SymmetricKey {
         let poolIDData = withUnsafeBytes(of: poolID.uuid) { Data($0) }
-        // Use HKDF to derive a proper-length signing key from the pool ID.
-        // The pool ID itself is too short / low-entropy for direct use as a key,
-        // but HKDF stretches it with a domain-specific info string.
         let derived = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: poolIDData),
-            salt: Data("StealthOS-RelayEnvelope-HMAC-Salt".utf8),
+            inputKeyMaterial: sharedSecret,
+            salt: poolIDData + Data("StealthOS-RelayEnvelope-HMAC-Salt".utf8),
             info: Data("envelope-integrity-v1".utf8),
             outputByteCount: 32
         )
         return derived
+    }
+
+    /// Appends a variable-length field to HMAC input with a 4-byte big-endian length prefix.
+    ///
+    /// Without length prefixes, concatenation of variable-length fields creates a collision
+    /// domain (e.g., origin="ab" + dest="cd" produces the same bytes as origin="abc" + dest="d").
+    /// Prefixing each field with its byte length eliminates this ambiguity.
+    private static func appendLengthPrefixed(_ data: Data, to buffer: inout Data) {
+        var length = UInt32(data.count).bigEndian
+        buffer.append(contentsOf: withUnsafeBytes(of: &length) { Data($0) })
+        buffer.append(data)
     }
 
     /// Computes an HMAC-SHA256 over the critical immutable routing fields.
@@ -297,12 +312,15 @@ extension RelayEnvelope {
     /// Covered fields: originPeerID, destinationPeerID, poolID, messageID, ttl, timestamp.
     /// The hop path is NOT covered because it changes legitimately at each relay hop.
     ///
+    /// Variable-length string fields (originPeerID, destinationPeerID) are written with
+    /// 4-byte big-endian length prefixes to prevent concatenation collision attacks.
+    ///
     /// - Parameter key: The symmetric key to use for HMAC computation.
     /// - Returns: The HMAC tag as raw `Data`.
     public func computeHMAC(using key: SymmetricKey) -> Data {
         var hmacInput = Data()
-        hmacInput.append(Data(originPeerID.utf8))
-        hmacInput.append(Data((destinationPeerID ?? "").utf8))
+        Self.appendLengthPrefixed(Data(originPeerID.utf8), to: &hmacInput)
+        Self.appendLengthPrefixed(Data((destinationPeerID ?? "").utf8), to: &hmacInput)
         hmacInput.append(withUnsafeBytes(of: poolID.uuid) { Data($0) })
         hmacInput.append(withUnsafeBytes(of: messageID.uuid) { Data($0) })
         // Use the original TTL (maxTTL) for HMAC so it's consistent across hops.
@@ -315,18 +333,27 @@ extension RelayEnvelope {
         return Data(tag)
     }
 
-    /// Verifies the envelope's HMAC against the provided key.
+    /// Verifies the envelope's HMAC against the provided key using constant-time comparison.
     ///
     /// - Parameter key: The symmetric key to use for verification.
-    /// - Returns: `true` if the HMAC is present and valid, or if no HMAC is present (backwards compat).
-    ///           `false` if the HMAC is present but does not match (tampered envelope).
+    /// - Returns: `true` if the HMAC is present and valid.
+    ///           `false` if the HMAC is missing or does not match (tampered or unsigned envelope).
     public func verifyHMAC(using key: SymmetricKey) -> Bool {
         guard let existingHMAC = envelopeHMAC else {
-            // No HMAC present — backwards compatibility: accept but caller should log a warning
-            return true
+            // SECURITY: Reject envelopes without HMAC. All envelopes MUST be signed.
+            return false
         }
-        let expected = computeHMAC(using: key)
-        return existingHMAC == expected
+        // Recompute the HMAC input to use CryptoKit's constant-time isValidAuthenticationCode.
+        // Must match the format used in computeHMAC() with length-prefixed variable-length fields.
+        var hmacInput = Data()
+        Self.appendLengthPrefixed(Data(originPeerID.utf8), to: &hmacInput)
+        Self.appendLengthPrefixed(Data((destinationPeerID ?? "").utf8), to: &hmacInput)
+        hmacInput.append(withUnsafeBytes(of: poolID.uuid) { Data($0) })
+        hmacInput.append(withUnsafeBytes(of: messageID.uuid) { Data($0) })
+        hmacInput.append(withUnsafeBytes(of: Self.maxTTL) { Data($0) })
+        hmacInput.append(withUnsafeBytes(of: timestamp.timeIntervalSince1970) { Data($0) })
+
+        return HMAC<SHA256>.isValidAuthenticationCode(existingHMAC, authenticating: hmacInput, using: key)
     }
 
     /// Whether this envelope has an HMAC attached.

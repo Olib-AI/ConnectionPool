@@ -18,7 +18,7 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Pool configuration for hosting
     @Published public var poolName: String = ""
-    @Published public var maxPeers: Int = 2
+    @Published public var maxPeers: Int = 8
     @Published public var requireEncryption: Bool = true
     @Published public var autoAcceptPeers: Bool = false
 
@@ -49,6 +49,22 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     @Published public var blockedDevices: [BlockedDevice] = []
     @Published public var showBlockedDevicesSheet: Bool = false
 
+    /// Server claim state
+    @Published public var claimCode: String = ""
+    @Published public var showClaimCodeInput: Bool = false
+    @Published public var isClaimingServer: Bool = false
+    @Published public var serverClaimed: Bool = false
+
+    /// Remote pool state
+    @Published public var transportMode: TransportMode = .local
+    @Published public var serverURL: String = ""
+    @Published public var remoteInvitations: [RemoteInvitation] = []
+    @Published public var showInvitationShareSheet: Bool = false
+    @Published public var currentRemoteInvitation: RemoteInvitation?
+    @Published public var showRemoteJoinSheet: Bool = false
+    @Published public var invitationURLInput: String = ""
+    @Published public var isConnectingRemote: Bool = false
+
     /// Error handling
     @Published public var errorMessage: String?
     @Published public var showError: Bool = false
@@ -58,6 +74,11 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Callback for opening a game
     public var onOpenGame: ((MultiplayerGameType) -> Void)?
+
+    // MARK: - Remote Pool Service
+
+    /// Service for managing remote host identity, invitations, and QR codes.
+    public let remotePoolService = RemotePoolService()
 
     // MARK: - Connection Pool Manager
 
@@ -78,6 +99,16 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     private var cancellables = Set<AnyCancellable>()
 
+    /// Peer IDs (relay-authenticated public keys) that were approved during this session.
+    /// Used to auto-accept reconnecting peers without re-prompting the host.
+    private var approvedPeerIDs: Set<String> = []
+
+    /// WebSocket transport reference for remote mode.
+    private var webSocketTransport: WebSocketTransport?
+
+    /// Pool ID for the current remote hosting session (used to retry HostAuth after claim).
+    private var remotePoolID: UUID?
+
     // MARK: - PoolAppLifecycle
 
     @Published public private(set) var runtimeState: PoolAppState = .active
@@ -95,6 +126,9 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
         // Sync initial state from the shared pool manager (in case connection was established before)
         syncInitialStateFromPoolManager()
+
+        // Auto-reconnect to saved remote pool if available
+        restoreSavedRemotePool()
     }
 
     /// Sync the ViewModel's published state with the shared pool manager's current state
@@ -110,6 +144,59 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         // Set the view to lobby if already connected
         if poolState == .hosting || poolState == .connected {
             currentView = .lobby
+        }
+    }
+
+    /// Restore a previously saved remote pool and auto-reconnect.
+    private func restoreSavedRemotePool() {
+        guard let saved = RemotePoolState.load() else { return }
+
+        // Only auto-reconnect if we were the host and the server was claimed
+        guard saved.isHost, saved.isClaimed else { return }
+
+        log("Restoring remote pool: \(saved.serverURL)", category: .network)
+
+        guard let url = URL(string: saved.serverURL) else { return }
+
+        let config = RemotePoolConfiguration(
+            serverURL: url,
+            poolName: saved.poolName,
+            maxPeers: saved.maxPeers
+        )
+
+        transportMode = .remote
+        serverURL = saved.serverURL
+        poolName = saved.poolName
+        maxPeers = saved.maxPeers
+
+        let transport = WebSocketTransport(
+            configuration: config,
+            displayName: poolManager.localProfile.displayName
+        )
+        transport.delegate = self
+        webSocketTransport = transport
+
+        remotePoolID = saved.poolID
+        do {
+            let identity = try remotePoolService.getOrCreateHostIdentity()
+            let poolInfo = PoolAdvertisementInfo(
+                poolID: saved.poolID,
+                poolName: saved.poolName,
+                hostName: poolManager.localProfile.displayName,
+                hasPoolCode: false,
+                maxPeers: saved.maxPeers,
+                hostProfile: poolManager.localProfile
+            )
+            transport.startAdvertising(poolInfo: poolInfo)
+            isHost = true
+            poolState = .connecting
+            isConnectingRemote = true
+            _ = identity
+        } catch {
+            log("Failed to restore remote pool: \(error)", category: .network)
+            transportMode = .local
+            webSocketTransport = nil
+            RemotePoolState.clear()
         }
     }
 
@@ -265,7 +352,24 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Explicitly disconnect from the pool. Call this when user wants to leave.
     public func explicitDisconnect() {
+        if transportMode == .remote {
+            webSocketTransport?.disconnect()
+            webSocketTransport = nil
+            poolManager.remoteTransport = nil
+            poolManager.remotePeerID = nil
+            poolManager.setRemotePoolState(poolState: .idle, session: nil, isHost: false)
+        }
         poolManager.disconnect()
+        transportMode = .local
+        serverURL = ""
+        remoteInvitations = []
+        showInvitationShareSheet = false
+        currentRemoteInvitation = nil
+        showRemoteJoinSheet = false
+        invitationURLInput = ""
+        isConnectingRemote = false
+        resetClaimState()
+        RemotePoolState.clear()
         currentView = .home
         chatMessages = []
         pendingInvitations = []
@@ -360,16 +464,64 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Disconnect from the current pool (user-initiated)
     public func disconnect() {
+        if transportMode == .remote {
+            webSocketTransport?.disconnect()
+            webSocketTransport = nil
+        }
         poolManager.disconnect()
-        currentView = .home
-        chatMessages = []
-        pendingInvitations = []
+
+        // Dismiss any open sheets first to avoid SwiftUI presentation conflicts
+        showInvitationShareSheet = false
+        showInvitationSheet = false
+        showRemoteJoinSheet = false
+        showClaimCodeInput = false
+        currentInvitation = nil
+        currentRemoteInvitation = nil
+
+        // Defer the full state reset to the next run loop tick so sheet
+        // dismissal animations complete before the view hierarchy changes.
+        // This prevents SwiftUI's sheet presentation state from getting
+        // corrupted by simultaneous view updates.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self else { return }
+
+            self.currentView = .home
+            self.chatMessages = []
+            self.pendingInvitations = []
+            self.approvedPeerIDs.removeAll()
+            self.transportMode = .local
+            self.isConnectingRemote = false
+            self.isHost = false
+            self.poolState = .idle
+            self.connectedPeers = []
+            self.currentSession = nil
+            self.remoteInvitations = []
+            self.isClaimingServer = false
+            self.claimCode = ""
+            self.invitationURLInput = ""
+            self.remotePoolID = nil
+        }
+
         log("ConnectionPool disconnected by user action", category: .runtime)
     }
 
     /// Accept an invitation
     public func acceptInvitation(_ invitation: DiscoveredPeer) {
-        poolManager.acceptInvitation(from: invitation.id)
+        // Track this peer's ID so reconnections are auto-accepted
+        approvedPeerIDs.insert(invitation.id)
+
+        if transportMode == .remote, let transport = webSocketTransport {
+            transport.acceptConnection(from: invitation.id)
+
+            // Remove single-use invitations once a peer joins through them.
+            // For multi-use invitations, keep them but remove expired ones.
+            remoteInvitations.removeAll { invite in
+                invite.isExpired || (invite.maxUses == 1)
+            }
+        } else {
+            poolManager.acceptInvitation(from: invitation.id)
+        }
         pendingInvitations.removeAll { $0.id == invitation.id }
 
         if currentInvitation?.id == invitation.id {
@@ -380,7 +532,11 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Reject an invitation
     public func rejectInvitation(_ invitation: DiscoveredPeer) {
-        poolManager.rejectInvitation(from: invitation.id)
+        if transportMode == .remote, let transport = webSocketTransport {
+            transport.rejectConnection(from: invitation.id)
+        } else {
+            poolManager.rejectInvitation(from: invitation.id)
+        }
         pendingInvitations.removeAll { $0.id == invitation.id }
 
         if currentInvitation?.id == invitation.id {
@@ -445,6 +601,221 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         onOpenGame?(gameType)
     }
 
+    // MARK: - Remote Pool Actions
+
+    /// Create a remote pool on the specified server.
+    public func createRemotePool(serverURL serverURLString: String) {
+        let trimmed = serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            showError(message: "Please enter a server URL")
+            return
+        }
+
+        // Normalize the URL: add ws:// scheme if missing.
+        // Use ws:// for local/IP connections, wss:// for domain names.
+        let normalized: String
+        if trimmed.hasPrefix("wss://") || trimmed.hasPrefix("ws://") {
+            normalized = trimmed
+        } else if trimmed.contains(".") && !trimmed.contains(":") {
+            // Looks like a domain name without port — use wss://
+            normalized = "wss://\(trimmed)"
+        } else {
+            // IP address or IP:port — use plain ws://
+            normalized = "ws://\(trimmed)"
+        }
+
+        guard let url = URL(string: normalized) else {
+            showError(message: "Invalid server URL")
+            return
+        }
+
+        let name = poolName.isEmpty ? "\(poolManager.localProfile.displayName)'s Pool" : poolName
+        let config = RemotePoolConfiguration(
+            serverURL: url,
+            poolName: name,
+            maxPeers: maxPeers
+        )
+
+        transportMode = .remote
+        serverURL = normalized
+
+        let transport = WebSocketTransport(
+            configuration: config,
+            displayName: poolManager.localProfile.displayName
+        )
+        transport.delegate = self
+        webSocketTransport = transport
+
+        let poolID = UUID()
+        remotePoolID = poolID
+        do {
+            let identity = try remotePoolService.getOrCreateHostIdentity()
+            let poolInfo = PoolAdvertisementInfo(
+                poolID: poolID,
+                poolName: name,
+                hostName: poolManager.localProfile.displayName,
+                hasPoolCode: false,
+                maxPeers: maxPeers,
+                hostProfile: poolManager.localProfile
+            )
+            transport.startAdvertising(poolInfo: poolInfo)
+            isHost = true
+            poolState = .connecting
+            isConnectingRemote = true
+            // Don't navigate to lobby yet — wait for HostAuthSuccess or error via delegate.
+            // The delegate's didChangeState(.advertising) will set poolState = .hosting
+            // and navigate to .lobby when the server confirms.
+            log("Connecting to remote server \(normalized)...", category: .network)
+            _ = identity
+        } catch {
+            showError(message: "Failed to create host identity: \(error.localizedDescription)")
+            transportMode = .local
+            webSocketTransport = nil
+        }
+    }
+
+    /// Submit the claim code to bind this device as the server's host.
+    ///
+    /// After a successful claim, the server remembers the bound host identity
+    /// and future connections proceed with normal HostAuth without re-claiming.
+    public func submitClaimCode() {
+        guard let transport = webSocketTransport else { return }
+        let code = claimCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else {
+            showError(message: "Please enter a claim code")
+            return
+        }
+        isClaimingServer = true
+        transport.claimServer(claimCode: code)
+    }
+
+    /// Handle a scanned QR code or deep link string for server claiming.
+    ///
+    /// Accepts any format supported by `WebSocketTransport.normalizeClaimCode`:
+    /// - `stealth://claim/<hex>` URL
+    /// - Dash-separated hex
+    /// - Raw hex string
+    ///
+    /// When a transport is already connected and waiting for a claim, this
+    /// automatically populates the claim code and submits it.
+    public func handleClaimDeepLink(_ rawValue: String) {
+        let normalized = WebSocketTransport.normalizeClaimCode(rawValue)
+        guard !normalized.isEmpty else {
+            showError(message: "Invalid claim QR code")
+            return
+        }
+        claimCode = normalized
+        // If we already have a transport connected and waiting for claim, submit automatically
+        if showClaimCodeInput, webSocketTransport != nil {
+            submitClaimCode()
+        }
+    }
+
+    /// Reset claim-related state when leaving the remote host flow.
+    private func resetClaimState() {
+        claimCode = ""
+        showClaimCodeInput = false
+        isClaimingServer = false
+        serverClaimed = false
+    }
+
+    /// Join a remote pool via invitation URL.
+    public func joinRemotePool(invitationURL: String) {
+        let trimmed = invitationURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            showError(message: "Please enter an invitation URL")
+            return
+        }
+
+        guard let url = URL(string: trimmed) else {
+            showError(message: "Invalid invitation URL")
+            return
+        }
+
+        guard let invitation = RemotePoolService.parseInvitationURL(url) else {
+            showError(message: "Could not parse invitation. Make sure the link is valid and not expired.")
+            return
+        }
+
+        if invitation.isExpired {
+            showError(message: "This invitation has expired.")
+            return
+        }
+
+        let config = RemotePoolConfiguration(
+            serverURL: invitation.serverURL,
+            poolName: "Remote Pool",
+            maxPeers: 8
+        )
+
+        transportMode = .remote
+        serverURL = invitation.serverURL.absoluteString
+        isConnectingRemote = true
+
+        let transport = WebSocketTransport(
+            configuration: config,
+            displayName: poolManager.localProfile.displayName
+        )
+        transport.delegate = self
+        webSocketTransport = transport
+
+        transport.requestJoinWithInvitation(invitation)
+        log("Joining remote pool via invitation", category: .network)
+    }
+
+    /// Generate a new invitation (remote mode, any connected member).
+    /// The host always approves join requests regardless of who created the invite.
+    public func createRemoteInvitation(maxUses: Int = 1, expiresInSecs: UInt64 = 300) {
+        guard transportMode == .remote else {
+            showError(message: "Invitations are only available in remote mode")
+            return
+        }
+        guard let transport = webSocketTransport else {
+            showError(message: "Not connected to remote server")
+            return
+        }
+        // Only the host can create invitations — the relay server requires the
+        // host's session token for CreateInvitation. Guests can share existing
+        // invitation URLs but cannot mint new ones.
+        guard isHost else {
+            // If we have an existing invitation from the host, share that instead
+            if let existing = remoteInvitations.first(where: { !$0.isExpired }) {
+                shareInvitation(existing)
+            } else {
+                showError(message: "Only the pool host can create new invitations.")
+            }
+            return
+        }
+
+        Task { @MainActor in
+            let invitation = await remotePoolService.createInvitation(
+                transport: transport,
+                maxUses: maxUses,
+                expiresInSecs: expiresInSecs
+            )
+            if let invitation {
+                remoteInvitations.append(invitation)
+                currentRemoteInvitation = invitation
+                showInvitationShareSheet = true
+                log("Created remote invitation (tokenId: \(invitation.tokenId.prefix(8))..., expires: \(invitation.expiresAt))", category: .network)
+            } else {
+                showError(message: "Failed to create invitation. Please try again.")
+            }
+        }
+    }
+
+    /// Share an existing invitation URL/QR.
+    public func shareInvitation(_ invitation: RemoteInvitation) {
+        currentRemoteInvitation = invitation
+        showInvitationShareSheet = true
+    }
+
+    /// Any connected member can generate an invite link.
+    /// The host still approves all joins.
+    public func requestInviteLink(maxUses: Int = 1, expiresInSecs: UInt64 = 300) {
+        createRemoteInvitation(maxUses: maxUses, expiresInSecs: expiresInSecs)
+    }
+
     /// Go back to home view
     public func goBack() {
         switch currentView {
@@ -452,7 +823,10 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             poolManager.disconnect()
             currentView = .home
         case .lobby:
-            if poolManager.poolState == .idle {
+            if transportMode == .remote {
+                // In remote mode, leaving the lobby means disconnecting
+                disconnect()
+            } else if poolManager.poolState == .idle {
                 // Not yet hosting, just go back
                 currentView = .home
             } else {
@@ -573,6 +947,228 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     private func showError(message: String) {
         errorMessage = message
         showError = true
+    }
+}
+
+// MARK: - TransportDelegate Conformance (Remote Mode)
+
+extension ConnectionPoolViewModel: TransportDelegate {
+
+    public func transport(_ transport: any TransportProvider, didChangeState state: TransportState) {
+        switch state {
+        case .connected:
+            isConnectingRemote = false
+            poolState = .connected
+            currentView = .lobby
+            // Bridge for joiner
+            if transportMode == .remote, let ws = webSocketTransport {
+                poolManager.remoteTransport = ws
+                poolManager.remotePeerID = ws.localPeerID
+                let session = PoolSession(
+                    name: poolName.isEmpty ? "Remote Pool" : poolName,
+                    hostPeerID: "host",
+                    maxPeers: maxPeers
+                )
+                poolManager.setRemotePoolState(poolState: .connected, session: session, isHost: false)
+
+                // Add self as a participant
+                let selfPeer = Peer(
+                    id: ws.localPeerID,
+                    displayName: poolManager.localProfile.displayName,
+                    isHost: false,
+                    status: .connected,
+                    profile: poolManager.localProfile
+                )
+                if !connectedPeers.contains(where: { $0.id == selfPeer.id }) {
+                    connectedPeers.insert(selfPeer, at: 0)
+                }
+                poolManager.addRemotePeer(selfPeer)
+            }
+        case .advertising:
+            isConnectingRemote = false
+            poolState = .hosting
+            currentView = .lobby
+            // Bridge remote state into ConnectionPoolManager so games/chat detect the pool
+            if transportMode == .remote, let ws = webSocketTransport, let poolID = remotePoolID {
+                poolManager.remoteTransport = ws
+                poolManager.remotePeerID = ws.localPeerID
+                let session = PoolSession(
+                    name: poolName,
+                    hostPeerID: poolManager.localPeerID,
+                    maxPeers: maxPeers
+                )
+                poolManager.setRemotePoolState(poolState: .hosting, session: session, isHost: true)
+
+                // Add the host as the first participant
+                let hostPeer = Peer(
+                    id: poolManager.localPeerID,
+                    displayName: poolManager.localProfile.displayName,
+                    isHost: true,
+                    status: .connected,
+                    profile: poolManager.localProfile
+                )
+                if !connectedPeers.contains(where: { $0.id == hostPeer.id }) {
+                    connectedPeers.insert(hostPeer, at: 0)
+                }
+                poolManager.addRemotePeer(hostPeer)
+            }
+            // Save remote pool state so it persists across app restarts
+            if transportMode == .remote, let poolID = remotePoolID {
+                let state = RemotePoolState(
+                    serverURL: serverURL,
+                    poolName: poolName,
+                    isClaimed: true,
+                    poolID: poolID,
+                    maxPeers: maxPeers,
+                    isHost: true
+                )
+                state.save()
+                log("Remote pool state saved", category: .network)
+            }
+        case .connecting:
+            poolState = .connecting
+        case .failed(let error):
+            isConnectingRemote = false
+            showError(message: error.localizedDescription)
+            poolState = .error(error.localizedDescription)
+        case .reconnecting:
+            break
+        case .idle:
+            // After a successful claim, the transport signals .idle so we can proceed to HostAuth.
+            if isClaimingServer {
+                isClaimingServer = false
+                serverClaimed = true
+                showClaimCodeInput = false
+
+                // Automatically proceed with HostAuth on the existing connection.
+                if let wsTransport = webSocketTransport, let poolID = remotePoolID {
+                    let name = poolName.isEmpty ? "\(poolManager.localProfile.displayName)'s Pool" : poolName
+                    let poolInfo = PoolAdvertisementInfo(
+                        poolID: poolID,
+                        poolName: name,
+                        hostName: poolManager.localProfile.displayName,
+                        hasPoolCode: false,
+                        maxPeers: maxPeers,
+                        hostProfile: poolManager.localProfile
+                    )
+                    wsTransport.sendHostAuthAfterClaim(poolInfo: poolInfo)
+                    log("Claim succeeded, proceeding to HostAuth", category: .network)
+                }
+            }
+        case .discovering:
+            break
+        }
+    }
+
+    public func transport(_ transport: any TransportProvider, peerDidConnect peer: TransportPeer) {
+        let newPeer = Peer(
+            id: peer.id,
+            displayName: peer.displayName,
+            isHost: false,
+            connectedAt: peer.connectedAt,
+            status: .connected,
+            connectionType: peer.connectionType
+        )
+        if !connectedPeers.contains(where: { $0.id == newPeer.id }) {
+            connectedPeers.append(newPeer)
+        }
+        // Bridge into ConnectionPoolManager so PoolChat and games see the peer
+        poolManager.addRemotePeer(newPeer)
+        let systemMessage = ChatMessage(
+            senderID: "system",
+            senderName: "System",
+            text: "\(peer.displayName) joined the pool",
+            isFromLocalUser: false,
+            isSystemMessage: true
+        )
+        if !chatMessages.contains(where: { $0.id == systemMessage.id }) {
+            chatMessages.append(systemMessage)
+        }
+    }
+
+    public func transport(_ transport: any TransportProvider, peerDidDisconnect peerID: String) {
+        let disconnectedPeer = connectedPeers.first(where: { $0.id == peerID })
+        connectedPeers.removeAll { $0.id == peerID }
+        // Bridge into ConnectionPoolManager
+        poolManager.removeRemotePeer(peerID)
+        if let name = disconnectedPeer?.effectiveDisplayName {
+            let systemMessage = ChatMessage(
+                senderID: "system",
+                senderName: "System",
+                text: "\(name) left the pool",
+                isFromLocalUser: false,
+                isSystemMessage: true
+            )
+            if !chatMessages.contains(where: { $0.id == systemMessage.id }) {
+                chatMessages.append(systemMessage)
+            }
+        }
+    }
+
+    public func transport(_ transport: any TransportProvider, didReceiveData data: Data, from peerID: String) {
+        // Decode as PoolMessage and inject into ConnectionPoolManager's pipeline.
+        // This makes PoolChat and games receive the message.
+        if let message = try? JSONDecoder().decode(PoolMessage.self, from: data) {
+            poolManager.injectReceivedMessage(message)
+            handleReceivedMessage(message)
+        }
+    }
+
+    public func transport(_ transport: any TransportProvider, didDiscoverPool pool: DiscoveredPool) {
+        // Remote pools are joined via invitation, not discovery. No-op.
+    }
+
+    public func transport(_ transport: any TransportProvider, didLosePool poolID: String) {
+        // No-op for remote mode.
+    }
+
+    public func transport(_ transport: any TransportProvider, didReceiveJoinRequest peerID: String,
+                          displayName: String, context: JoinContext) {
+        let discovered = DiscoveredPeer(
+            id: peerID,
+            displayName: displayName,
+            isInviting: false,
+            hasPoolCode: false
+        )
+
+        // Auto-accept peers whose cryptographic identity (public key) was
+        // already approved during this session. This handles reconnections
+        // without re-prompting the host while remaining secure — the peerID
+        // is relay-authenticated, not self-reported.
+        if approvedPeerIDs.contains(peerID) {
+            log("Auto-accepting reconnecting peer (approved ID): \(peerID.prefix(8))...", category: .network)
+            acceptInvitation(discovered)
+            return
+        }
+
+        if !pendingInvitations.contains(where: { $0.id == discovered.id }) {
+            pendingInvitations.append(discovered)
+        }
+        if !autoAcceptPeers && currentInvitation == nil {
+            // Dismiss the invitation share sheet if it's open so the
+            // join-approval sheet can present without being blocked.
+            if showInvitationShareSheet {
+                showInvitationShareSheet = false
+            }
+            currentInvitation = discovered
+            showInvitationSheet = true
+        }
+    }
+
+    public func transport(_ transport: any TransportProvider, didFailWithError error: TransportError) {
+        isConnectingRemote = false
+
+        switch error {
+        case .serverUnclaimed:
+            // Server is fresh and needs claiming before HostAuth can proceed.
+            showClaimCodeInput = true
+        case .authenticationFailed where isClaimingServer:
+            // Claim was rejected by the server.
+            isClaimingServer = false
+            showError(message: "Claim rejected. Check that the claim code is correct and has not already been used.")
+        default:
+            showError(message: error.localizedDescription)
+        }
     }
 }
 

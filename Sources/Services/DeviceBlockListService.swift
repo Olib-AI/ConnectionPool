@@ -50,14 +50,14 @@ public final class DeviceBlockListService {
         )
         blockedDevices.append(device)
         save()
-        log("Blocked device: \(displayName) (\(peerID)), reason: \(reason.rawValue)", category: .network)
+        log("Blocked device: \(displayName) (\(peerID.prefix(8))...), reason: \(reason.rawValue)", category: .network)
     }
 
     /// Unblock a device
     public func unblockDevice(_ peerID: String) {
         blockedDevices.removeAll { $0.id == peerID }
         save()
-        log("Unblocked device: \(peerID)", category: .network)
+        log("Unblocked device: \(peerID.prefix(8))...", category: .network)
     }
 
     // MARK: - Persistence

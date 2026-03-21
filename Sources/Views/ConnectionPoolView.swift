@@ -193,126 +193,206 @@ private struct ChatRedirectView: View {
 
 private struct HomeView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @State private var showRemoteHostSheet = false
+
+    @State private var showDeleteServerAlert = false
 
     var body: some View {
-        VStack(spacing: 24) {
-            // Profile button in top right
-            HStack {
-                Spacer()
-                ProfileButton(viewModel: viewModel)
-            }
-            .padding(.horizontal)
-            .padding(.top, 8)
+        ScrollView {
+            VStack(spacing: 20) {
+                // Profile button in top right
+                HStack {
+                    Spacer()
+                    ProfileButton(viewModel: viewModel)
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
 
-            Spacer()
+                // App Icon & Title
+                VStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [.blue, .purple],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 80, height: 80)
 
-            // App Icon & Title
-            VStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.white)
+                    }
+
+                    Text("Connection Pool")
+                        .font(.title.bold())
+
+                    Text("Connect with nearby devices...")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                // Action Buttons
+                VStack(spacing: 16) {
+                    // Host Pool Button
+                    Button {
+                        viewModel.currentView = .lobby
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "wifi.circle.fill")
+                                .font(.title2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Host Pool")
+                                    .font(.headline)
+                                Text("Create a new pool for others to join")
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.8))
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(
                             LinearGradient(
-                                colors: [.blue, .purple],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
+                                colors: [.blue, .blue.opacity(0.8)],
+                                startPoint: .leading,
+                                endPoint: .trailing
                             )
                         )
-                        .frame(width: 80, height: 80)
-
-                    Image(systemName: "antenna.radiowaves.left.and.right")
-                        .font(.system(size: 36))
                         .foregroundStyle(.white)
-                }
-
-                Text("Connection Pool")
-                    .font(.title.bold())
-
-                Text("Connect with nearby devices\nfor chat and games")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-
-            Spacer()
-
-            // Action Buttons
-            VStack(spacing: 16) {
-                // Host Pool Button
-                Button {
-                    viewModel.currentView = .lobby
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "wifi.circle.fill")
-                            .font(.title2)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Host Pool")
-                                .font(.headline)
-                            Text("Create a new pool for others to join")
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.8))
-                        }
-                        Spacer()
-                        Image(systemName: "chevron.right")
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(
-                        LinearGradient(
-                            colors: [.blue, .blue.opacity(0.8)],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                }
 
-                // Join Pool Button
-                Button {
-                    viewModel.startBrowsing()
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "magnifyingglass.circle.fill")
-                            .font(.title2)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Join Pool")
-                                .font(.headline)
-                            Text("Find and join nearby pools")
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.8))
+                    // Join Pool Button
+                    Button {
+                        viewModel.startBrowsing()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "magnifyingglass.circle.fill")
+                                .font(.title2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Join Pool")
+                                    .font(.headline)
+                                Text("Find and join nearby pools")
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.8))
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
                         }
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(
-                        LinearGradient(
-                            colors: [.green, .green.opacity(0.8)],
-                            startPoint: .leading,
-                            endPoint: .trailing
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            LinearGradient(
+                                colors: [.green, .green.opacity(0.8)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
                         )
-                    )
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
                 }
-            }
-            .padding(.horizontal)
+                .padding(.horizontal)
 
-            // Info Section
-            VStack(spacing: 8) {
+                // Saved Remote Server (if claimed)
+                if let saved = RemotePoolState.load(), saved.isClaimed {
+                    VStack(spacing: 8) {
+                        HStack {
+                            Button {
+                                viewModel.createRemotePool(serverURL: saved.serverURL)
+                            } label: {
+                                HStack {
+                                    Image(systemName: "server.rack")
+                                        .foregroundStyle(.green)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(saved.poolName.isEmpty ? "My Server" : saved.poolName)
+                                            .font(.subheadline.bold())
+                                        Text(saved.serverURL)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+
+                            Button(role: .destructive) {
+                                showDeleteServerAlert = true
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.red)
+                                    .padding(8)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding()
+                        .background(Color.green.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                    .padding(.horizontal)
+                }
+
+                // Remote Pool Section
+                VStack(spacing: 12) {
+                    Text("Remote Pool")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    VStack(spacing: 10) {
+                        Button(action: { showRemoteHostSheet = true }) {
+                            Label("Host Remote Pool", systemImage: "server.rack")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button(action: { viewModel.showRemoteJoinSheet = true }) {
+                            Label("Join via Invitation", systemImage: "link")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(.horizontal, 40)
+                }
+                .padding(.top, 4)
+
+                // Info Section
                 HStack(spacing: 16) {
                     InfoBadge(icon: "lock.fill", text: "Encrypted")
                     InfoBadge(icon: "wifi.slash", text: "No Internet")
                     InfoBadge(icon: "person.3.fill", text: "Up to 8")
                 }
+                .padding(.top, 4)
+                .padding(.bottom, 16)
             }
-            .padding(.top, 8)
-
-            Spacer()
+            .padding()
         }
-        .padding()
+        .alert("Remove Server", isPresented: $showDeleteServerAlert) {
+            Button("Remove", role: .destructive) {
+                RemotePoolState.clear()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will remove the saved relay server. You can re-add it later by claiming the server again.")
+        }
         .crossPlatformNavigationBarHidden(true)
+        .sheet(isPresented: $showRemoteHostSheet) {
+            RemoteHostSheet(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.showRemoteJoinSheet) {
+            RemoteJoinSheet(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.showInvitationShareSheet) {
+            InvitationShareSheet(viewModel: viewModel)
+        }
     }
 }
 
@@ -583,6 +663,9 @@ private struct PoolLobbyView: View {
         }
         .sheet(isPresented: $showInviteSheet) {
             InvitePeersSheet(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.showInvitationShareSheet) {
+            InvitationShareSheet(viewModel: viewModel)
         }
     }
 
@@ -1145,8 +1228,8 @@ private struct QuickActionsCard: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            // Invite button (for host)
-            if viewModel.isHost {
+            // Invite button (for host, local mode)
+            if viewModel.isHost && viewModel.transportMode == .local {
                 Button {
                     showInviteSheet = true
                 } label: {
@@ -1162,6 +1245,32 @@ private struct QuickActionsCard: View {
                     .background(Color.green.opacity(0.1))
                     .foregroundStyle(.green)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            }
+
+            // Remote mode invitation actions (available to any connected member)
+            if viewModel.transportMode == .remote {
+                // Create/request invitation link
+                Button {
+                    viewModel.requestInviteLink()
+                } label: {
+                    HStack {
+                        Image(systemName: "link.badge.plus")
+                            .font(.title3)
+                        Text("Invite a Friend")
+                            .font(.headline)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                    }
+                    .padding()
+                    .background(Color.green.opacity(0.1))
+                    .foregroundStyle(.green)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+
+                // Active invitations list (host only)
+                if viewModel.isHost && !viewModel.remoteInvitations.isEmpty {
+                    RemoteInvitationsCard(viewModel: viewModel)
                 }
             }
 
@@ -2021,5 +2130,526 @@ private struct ProfileSettingsSheet: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Remote Host Sheet
+
+private struct RemoteHostSheet: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var serverURLInput: String = ""
+    @State private var showQRScanner: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 24) {
+                    // Header
+                    VStack(spacing: 12) {
+                        ZStack {
+                            Circle()
+                                .fill(Color.purple.opacity(0.15))
+                                .frame(width: 80, height: 80)
+
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 36))
+                                .foregroundStyle(.purple)
+                        }
+
+                        Text("Host Remote Pool")
+                            .font(.title2.bold())
+
+                        Text("Create a pool that anyone can join\nvia invitation link, from anywhere.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.top)
+
+                    // Server URL
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Server URL")
+                            .font(.headline)
+
+                        TextField("10.0.0.4:9090 or relay.example.com", text: $serverURLInput)
+                            .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                            .crossPlatformTextField()
+
+                        Text("IP:port for local, domain for internet (via cloudflared)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // Pool Name
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Pool Name")
+                            .font(.headline)
+
+                        TextField("Enter pool name", text: $viewModel.poolName)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    // Max Members
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Max Members")
+                            .font(.headline)
+
+                        Picker("Max Members", selection: $viewModel.maxPeers) {
+                            ForEach([2, 4, 6, 8, 10, 12, 16], id: \.self) { count in
+                                Text("\(count) members").tag(count)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Text("Maximum number of peers that can join this pool")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // Server Claim Section (shown when server is unclaimed)
+                    if viewModel.showClaimCodeInput {
+                        VStack(spacing: 12) {
+                            Image(systemName: "lock.shield")
+                                .font(.system(size: 40))
+                                .foregroundStyle(.orange)
+
+                            Text("Server Claim Required")
+                                .font(.headline)
+
+                            Text("Scan the QR code or enter the claim code from your server's Docker logs.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+
+                            #if os(iOS)
+                            Button {
+                                showQRScanner = true
+                            } label: {
+                                HStack {
+                                    Image(systemName: "qrcode.viewfinder")
+                                    Text("Scan QR Code")
+                                }
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                            }
+                            .background(Color.orange.opacity(0.15))
+                            .foregroundStyle(.orange)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            #endif
+
+                            HStack {
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.3))
+                                    .frame(height: 1)
+                                Text("or enter manually")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.3))
+                                    .frame(height: 1)
+                            }
+
+                            TextField("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", text: $viewModel.claimCode)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
+                                .autocorrectionDisabled()
+                                #if os(iOS)
+                                .textInputAutocapitalization(.characters)
+                                #endif
+
+                            Button(action: { viewModel.submitClaimCode() }) {
+                                if viewModel.isClaimingServer {
+                                    ProgressView()
+                                        .frame(maxWidth: .infinity)
+                                        .padding()
+                                } else {
+                                    HStack {
+                                        Image(systemName: "key.fill")
+                                        Text("Claim Server")
+                                    }
+                                    .font(.headline)
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                                }
+                            }
+                            .background(viewModel.claimCode.isEmpty || viewModel.isClaimingServer ? Color.gray : Color.orange)
+                            .foregroundStyle(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .disabled(viewModel.claimCode.isEmpty || viewModel.isClaimingServer)
+                        }
+                        .padding()
+                        .background(Color.orange.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                    }
+
+                    // Server claimed confirmation
+                    if viewModel.serverClaimed {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                            Text("Server claimed successfully")
+                                .font(.subheadline)
+                                .foregroundStyle(.green)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.green.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+
+                    Spacer(minLength: 20)
+
+                    // Create Button (hidden when claim input is shown but not yet claimed)
+                    if !viewModel.showClaimCodeInput {
+                        Button {
+                            viewModel.createRemotePool(serverURL: serverURLInput)
+                            // Don't dismiss — wait for connection result.
+                            // If server is unclaimed, showClaimCodeInput becomes true
+                            // and the claim UI appears in this same sheet.
+                        } label: {
+                            HStack {
+                                Image(systemName: "antenna.radiowaves.left.and.right")
+                                Text("Create Remote Pool")
+                            }
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(serverURLInput.isEmpty ? Color.gray : Color.purple)
+                            .foregroundStyle(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                        .disabled(serverURLInput.isEmpty)
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("")
+            .crossPlatformInlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        viewModel.showClaimCodeInput = false
+                        viewModel.isClaimingServer = false
+                        viewModel.serverClaimed = false
+                        viewModel.claimCode = ""
+                        dismiss()
+                    }
+                }
+            }
+            .sheet(isPresented: $showQRScanner) {
+                ClaimScannerSheet(
+                    scannedCode: $viewModel.claimCode,
+                    isPresented: $showQRScanner,
+                    onScanned: {
+                        viewModel.handleClaimDeepLink(viewModel.claimCode)
+                    }
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Remote Join Sheet
+
+private struct RemoteJoinSheet: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                // Header
+                VStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.blue.opacity(0.15))
+                            .frame(width: 80, height: 80)
+
+                        Image(systemName: "link")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.blue)
+                    }
+
+                    Text("Join via Invitation")
+                        .font(.title2.bold())
+
+                    Text("Enter the invitation link shared\nby the pool host or a member.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top)
+
+                // Invitation URL
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Invitation URL")
+                        .font(.headline)
+
+                    TextField("stealth://invite/...", text: $viewModel.invitationURLInput)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .crossPlatformTextField()
+
+                    Text("Paste the full invitation link")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if viewModel.isConnectingRemote {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text("Connecting...")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                // Join Button
+                Button {
+                    viewModel.joinRemotePool(invitationURL: viewModel.invitationURLInput)
+                    dismiss()
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.right.circle.fill")
+                        Text("Join Pool")
+                    }
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(viewModel.invitationURLInput.isEmpty ? Color.gray : Color.blue)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .disabled(viewModel.invitationURLInput.isEmpty || viewModel.isConnectingRemote)
+            }
+            .padding()
+            .navigationTitle("")
+            .crossPlatformInlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Invitation Share Sheet
+
+private struct InvitationShareSheet: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                if let invitation = viewModel.currentRemoteInvitation {
+                    // QR Code
+                    VStack(spacing: 16) {
+                        if let qrImage = RemotePoolService.generateQRCode(for: invitation, size: 200) {
+                            #if canImport(CoreImage)
+                            Image(decorative: qrImage, scale: 1.0)
+                                .interpolation(.none)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 200, height: 200)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            #endif
+                        } else {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.systemGray6Color)
+                                .frame(width: 200, height: 200)
+                                .overlay {
+                                    VStack(spacing: 8) {
+                                        Image(systemName: "qrcode")
+                                            .font(.system(size: 48))
+                                            .foregroundStyle(.secondary)
+                                        Text("QR Code")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                        }
+
+                        Text("Scan to Join")
+                            .font(.headline)
+                    }
+                    .padding(.top)
+
+                    // URL display
+                    VStack(spacing: 8) {
+                        Text(invitation.url.absoluteString)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+
+                        // Copy button
+                        Button {
+                            CrossPlatformClipboard.copyToClipboard(invitation.url.absoluteString)
+                            copied = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                copied = false
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                                Text(copied ? "Copied!" : "Copy Link")
+                            }
+                            .font(.subheadline.bold())
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(copied ? Color.green : Color.blue)
+                            .foregroundStyle(.white)
+                            .clipShape(Capsule())
+                        }
+                    }
+
+                    // Expiry info
+                    if !invitation.isExpired {
+                        HStack(spacing: 6) {
+                            Image(systemName: "clock")
+                                .font(.caption)
+                            Text("Expires \(invitation.expiresAt, style: .relative)")
+                                .font(.caption)
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.systemGray6Color)
+                        .clipShape(Capsule())
+                    } else {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.caption)
+                            Text("Expired")
+                                .font(.caption)
+                        }
+                        .foregroundStyle(.red)
+                    }
+
+                    if let maxUses = invitation.maxUses {
+                        Text("Max uses: \(maxUses)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // Info
+                    HStack(spacing: 8) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                        Text("The host will approve join requests from this link.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding()
+                    .background(Color.blue.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    Spacer()
+                } else {
+                    Spacer()
+                    Text("No invitation available")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            .padding()
+            .navigationTitle("Share Invitation")
+            .crossPlatformInlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Remote Invitations Card
+
+private struct RemoteInvitationsCard: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "link")
+                    .foregroundStyle(.purple)
+                Text("Active Invitations")
+                    .font(.subheadline.bold())
+
+                Spacer()
+
+                Text("\(viewModel.remoteInvitations.filter { !$0.isExpired }.count)")
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.purple)
+                    .clipShape(Capsule())
+            }
+
+            ForEach(viewModel.remoteInvitations) { invitation in
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(invitation.tokenId.prefix(8) + "...")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.primary)
+
+                        if invitation.isExpired {
+                            Text("Expired")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        } else {
+                            Text("Expires \(invitation.expiresAt, style: .relative)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Spacer()
+
+                    if !invitation.isExpired {
+                        Button {
+                            viewModel.shareInvitation(invitation)
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.subheadline)
+                                .foregroundStyle(.purple)
+                                .padding(8)
+                                .background(Color.purple.opacity(0.1))
+                                .clipShape(Circle())
+                        }
+                    }
+
+                    Button {
+                        viewModel.remoteInvitations.removeAll { $0.id == invitation.id }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(6)
+                            .background(Color.secondary.opacity(0.1))
+                            .clipShape(Circle())
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding()
+        .background(Color.purple.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }

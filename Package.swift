@@ -12,5 +12,10 @@ let package = Package(
             name: "ConnectionPool",
             path: "Sources"
         ),
+        .testTarget(
+            name: "ConnectionPoolTests",
+            dependencies: ["ConnectionPool"],
+            path: "Tests/ConnectionPoolTests"
+        ),
     ]
 )
