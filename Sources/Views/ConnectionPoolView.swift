@@ -413,7 +413,11 @@ private struct HomeView: View {
             RemoteJoinSheet(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.showInvitationShareSheet) {
-            InvitationShareSheet(viewModel: viewModel)
+            if let invitation = viewModel.currentRemoteInvitation {
+                InviteCardShareSheet(viewModel: viewModel, invitation: invitation)
+            } else {
+                Text("No invitation available").padding()
+            }
         }
     }
 }
@@ -692,7 +696,11 @@ private struct PoolLobbyView: View {
             InvitePeersSheet(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.showInvitationShareSheet) {
-            InvitationShareSheet(viewModel: viewModel)
+            if let invitation = viewModel.currentRemoteInvitation {
+                InviteCardShareSheet(viewModel: viewModel, invitation: invitation)
+            } else {
+                Text("No invitation available").padding()
+            }
         }
         .alert("Edit Server URL", isPresented: $viewModel.showEditServerURL) {
             TextField("wss://relay.example.com", text: $viewModel.editingServerURL)
@@ -2632,223 +2640,12 @@ private struct RemoteJoinSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 24) {
-                // Header
-                VStack(spacing: 12) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.blue.opacity(0.15))
-                            .frame(width: 80, height: 80)
-
-                        Image(systemName: "link")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.blue)
-                    }
-
-                    Text("Join via Invitation")
-                        .font(.title2.bold())
-
-                    Text("Enter the invitation link shared\nby the pool host or a member.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .padding(.top)
-
-                // Invitation URL
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Invitation URL")
-                        .font(.headline)
-
-                    TextField("stealth://invite/...", text: $viewModel.invitationURLInput)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                        .crossPlatformTextField()
-
-                    Text("Paste the full invitation link")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if viewModel.isConnectingRemote {
-                    HStack(spacing: 12) {
-                        ProgressView()
-                        Text("Connecting...")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Spacer()
-
-                // Join Button
-                Button {
-                    viewModel.joinRemotePool(invitationURL: viewModel.invitationURLInput)
-                    dismiss()
-                } label: {
-                    HStack {
-                        Image(systemName: "arrow.right.circle.fill")
-                        Text("Join Pool")
-                    }
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(viewModel.invitationURLInput.isEmpty ? Color.gray : Color.blue)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                }
-                .disabled(viewModel.invitationURLInput.isEmpty || viewModel.isConnectingRemote)
-            }
-            .padding()
-            .navigationTitle("")
-            .crossPlatformInlineNavigationTitle()
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-            }
-        }
+        ReceiveInvitationView(viewModel: viewModel)
     }
 }
 
-// MARK: - Invitation Share Sheet
-
-private struct InvitationShareSheet: View {
-    @ObservedObject var viewModel: ConnectionPoolViewModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var copied = false
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 24) {
-                if let invitation = viewModel.currentRemoteInvitation {
-                    // QR Code
-                    VStack(spacing: 16) {
-                        if let qrImage = RemotePoolService.generateQRCode(for: invitation, size: 200) {
-                            #if canImport(CoreImage)
-                            Image(decorative: qrImage, scale: 1.0)
-                                .interpolation(.none)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 200, height: 200)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                            #endif
-                        } else {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.systemGray6Color)
-                                .frame(width: 200, height: 200)
-                                .overlay {
-                                    VStack(spacing: 8) {
-                                        Image(systemName: "qrcode")
-                                            .font(.system(size: 48))
-                                            .foregroundStyle(.secondary)
-                                        Text("QR Code")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                        }
-
-                        Text("Scan to Join")
-                            .font(.headline)
-                    }
-                    .padding(.top)
-
-                    // URL display
-                    VStack(spacing: 8) {
-                        Text(invitation.url.absoluteString)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(3)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
-
-                        // Copy button
-                        Button {
-                            CrossPlatformClipboard.copyToClipboard(invitation.url.absoluteString)
-                            copied = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                copied = false
-                            }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                                Text(copied ? "Copied!" : "Copy Link")
-                            }
-                            .font(.subheadline.bold())
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
-                            .background(copied ? Color.green : Color.blue)
-                            .foregroundStyle(.white)
-                            .clipShape(Capsule())
-                        }
-                    }
-
-                    // Expiry info
-                    if !invitation.isExpired {
-                        HStack(spacing: 6) {
-                            Image(systemName: "clock")
-                                .font(.caption)
-                            Text("Expires \(invitation.expiresAt, style: .relative)")
-                                .font(.caption)
-                        }
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.systemGray6Color)
-                        .clipShape(Capsule())
-                    } else {
-                        HStack(spacing: 6) {
-                            Image(systemName: "exclamationmark.triangle")
-                                .font(.caption)
-                            Text("Expired")
-                                .font(.caption)
-                        }
-                        .foregroundStyle(.red)
-                    }
-
-                    if let maxUses = invitation.maxUses {
-                        Text("Max uses: \(maxUses)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    // Info
-                    HStack(spacing: 8) {
-                        Image(systemName: "info.circle.fill")
-                            .foregroundStyle(.blue)
-                        Text("The host will approve join requests from this link.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding()
-                    .background(Color.blue.opacity(0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-
-                    Spacer()
-                } else {
-                    Spacer()
-                    Text("No invitation available")
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-            }
-            .padding()
-            .navigationTitle("Share Invitation")
-            .crossPlatformInlineNavigationTitle()
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
-            }
-        }
-    }
-}
+// MARK: - Invitation Share Sheet (replaced by InviteCardShareSheet)
+// The PIN-driven invite-card flow lives in InviteCardShareSheet.swift.
 
 // MARK: - Remote Invitations Card
 

@@ -142,6 +142,23 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
         // Auto-reconnect to saved remote pool if available
         restoreSavedRemotePool()
+
+        // Listen for `.stcard` invite-card opens routed by the app's URL handler.
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("StealthOSIncomingInviteCard"),
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let bytes = note.userInfo?["bytes"] as? Data else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                do {
+                    try await self.handleIncomingInviteCard(bytes: bytes)
+                } catch {
+                    self.showError(message: error.localizedDescription)
+                }
+            }
+        }
     }
 
     /// Sync the ViewModel's published state with the shared pool manager's current state
@@ -964,6 +981,36 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         currentRemoteInvitation = invitation
         showInvitationShareSheet = true
     }
+
+    /// Open a `.stcard` file the user received via iMessage / Files / AirDrop /
+    /// share sheet. Decodes the wrapper to recover the inner invitation URL
+    /// and runs it through the existing remote-pool join flow.
+    @MainActor
+    public func handleIncomingInviteCard(bytes: Data) async throws {
+        let parsed = try RemotePoolService.parseInvitationCardBytes(bytes)
+        if parsed.isExpired {
+            throw RemotePoolService.CardPackagingError.malformedInnerURL
+        }
+
+        let config = RemotePoolConfiguration(
+            serverURL: parsed.serverURL,
+            poolName: "Remote Pool",
+            maxPeers: 8
+        )
+        transportMode = .remote
+        serverURL = parsed.serverURL.absoluteString
+        isConnectingRemote = true
+
+        let transport = WebSocketTransport(
+            configuration: config,
+            displayName: poolManager.localProfile.displayName
+        )
+        transport.delegate = self
+        webSocketTransport = transport
+        transport.requestJoinWithInvitation(parsed)
+        log("Joining remote pool via invite card", category: .network)
+    }
+
 
     /// Any connected member can generate an invite link.
     /// The host still approves all joins.
