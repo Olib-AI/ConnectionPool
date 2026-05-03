@@ -1682,15 +1682,21 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
                 poolID = UUID()
             }
 
+            // Prefer the relay's authoritative pool name (from JoinAccepted.pool_info.name)
+            // over the discovery-stage placeholder. The placeholder can leak the joiner's
+            // own user name into the pool-name slot when the discovery side wasn't given a
+            // proper pool name to work with.
+            let resolvedPoolName = remoteTransport?.authoritativePoolName ?? joining.displayName
+
             currentSession = PoolSession(
                 id: poolID,
-                name: joining.displayName,
+                name: resolvedPoolName,
                 hostPeerID: hostID,
                 isEncrypted: true
                 // Note: joiners do not store the pool code -- only the host has it
             )
 
-            log("[RELAY_SESSION] Created PoolSession for relay joiner: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
+            log("[RELAY_SESSION] Created PoolSession for relay joiner: name=\(resolvedPoolName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
 
             // Wire mesh relay service with pool context for relay joiner
             meshRelayService?.setCurrentPool(poolID)
@@ -1842,16 +1848,21 @@ extension ConnectionPoolManager: MCSessionDelegate {
                             poolID = UUID()
                         }
 
-                        // Create the session with info from discovery
+                        // Prefer the relay's authoritative pool name (JoinAccepted.pool_info.name)
+                        // when we have it. Discovery-stage `displayName` is unreliable for remote
+                        // pools — it can leak the joiner's own user name into the pool-name slot.
+                        let resolvedPoolName = self.remoteTransport?.authoritativePoolName ?? joining.displayName
+
+                        // Create the session with the resolved pool name
                         currentSession = PoolSession(
                             id: poolID,
-                            name: joining.displayName, // This is the pool name from discovery
+                            name: resolvedPoolName,
                             hostPeerID: hostID,
                             isEncrypted: true // Assume encrypted
                             // Note: joiners do not store the pool code -- only the host has it
                         )
 
-                        log("Created PoolSession for non-host peer: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
+                        log("Created PoolSession for non-host peer: name=\(resolvedPoolName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
 
                         // Wire mesh relay service with pool context for joiner
                         self.meshRelayService?.setCurrentPool(poolID)

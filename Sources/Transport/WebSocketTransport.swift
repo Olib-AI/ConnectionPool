@@ -137,6 +137,12 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// Pool info received after joining.
     private var currentPoolInfo: ServerPoolInfo?
 
+    /// Authoritative pool name from the relay's most recent `JoinAccepted.pool_info`.
+    /// Members read this when constructing their `PoolSession` so the displayed name
+    /// matches what the host configured — not the joiner's own user name (which is
+    /// what the discovery-stage placeholder used to leak through).
+    public var authoritativePoolName: String? { currentPoolInfo?.name }
+
     // MARK: - Host State
 
     /// The host identity used for authentication (only set when hosting).
