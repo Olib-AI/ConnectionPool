@@ -443,6 +443,60 @@ private struct InfoBadge: View {
     }
 }
 
+// MARK: - Host Offline Pill
+
+/// Subtle warning pill rendered in the pool lobby whenever the remote relay reports
+/// `pool_host_status { online: false }`. The pool itself is still alive — chat, calls,
+/// games, and the relay tunnel exit continue to work — but new joins are gated on the
+/// host approving them, so we surface this so users know why the "Invite a Friend"
+/// action is disabled.
+private struct HostOfflinePill: View {
+    let offlineSince: Date?
+
+    /// Shared relative formatter — instantiating `RelativeDateTimeFormatter` is cheap but
+    /// repeating it on every body re-render isn't free, so it lives in a static.
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.orange)
+                Text("New invitations are paused until the host comes back. Existing chat, calls, and tunneling keep working.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var headline: String {
+        if let offlineSince {
+            let suffix = Self.relativeFormatter.localizedString(for: offlineSince, relativeTo: Date())
+            return "Host offline · \(suffix)"
+        } else {
+            return "Host offline"
+        }
+    }
+}
+
 // MARK: - Browse Pools View
 
 private struct BrowsePoolsView: View {
@@ -667,6 +721,13 @@ private struct PoolLobbyView: View {
                         // Connection Status
                         ConnectionStatusCard(viewModel: viewModel)
 
+                        // Host-offline pill (remote pools only — local Multipeer pools
+                        // have no concept of "host offline"; the host either is or isn't
+                        // in MC range).
+                        if viewModel.transportMode == .remote && !viewModel.hostOnline {
+                            HostOfflinePill(offlineSince: viewModel.hostOfflineSince)
+                        }
+
                         // Server URL Card (remote mode, host only)
                         if viewModel.transportMode == .remote && viewModel.isHost {
                             ServerURLCard(viewModel: viewModel)
@@ -679,6 +740,21 @@ private struct PoolLobbyView: View {
 
                         // Participants
                         ParticipantsCard(viewModel: viewModel)
+
+                        // Tunnel-Exit host control. Remote pools only — local Multipeer pools have
+                        // no relay state. Visible to the host immediately, regardless of how many
+                        // guests have joined.
+                        if viewModel.transportMode == .remote && viewModel.isHost {
+                            TunnelExitHostCard(viewModel: viewModel)
+                        }
+
+                        // Tunnel-Through-Relay card. Remote pools only — local Multipeer pools
+                        // have no relay. Visible to everyone in the pool (including the host —
+                        // a host can use their own relay as an exit for their own traffic).
+                        // The action button is disabled until `tunnelExitEnabled` is on.
+                        if viewModel.transportMode == .remote {
+                            RelayTunnelCard(viewModel: viewModel)
+                        }
 
                         // Quick Actions
                         QuickActionsCard(viewModel: viewModel, showInviteSheet: $showInviteSheet)
@@ -985,6 +1061,129 @@ private struct ServerURLCard: View {
 }
 
 // MARK: - Connection Status Card
+
+// MARK: - Tunnel Exit Card (Host)
+
+/// Host-side card that controls whether pool members can route their browser traffic
+/// through the StealthRelay server's internet connection. The host's iPhone is NOT in
+/// the data path — the relay opens the upstream sockets. This toggle is the per-pool
+/// approval gate; the relay's server-side `tunnel.enabled` flag must also be on.
+private struct TunnelExitHostCard: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: viewModel.hostTunnelExitEnabled ? "shield.checkerboard" : "shield.lefthalf.filled")
+                    .foregroundStyle(viewModel.hostTunnelExitEnabled ? Color.green : Color.accentColor)
+                Text("Allow Members to Use Relay Exit")
+                    .font(.headline)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { viewModel.hostTunnelExitEnabled },
+                    set: { newValue in
+                        Task { await viewModel.setHostTunnelExitEnabled(newValue) }
+                    }
+                ))
+                .labelsHidden()
+            }
+
+            if viewModel.hostTunnelExitEnabled {
+                Text("Members of this pool can route their browser traffic through the relay server's internet connection. The relay's IP becomes the exit address — your phone is not in the data path.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("When enabled, members of this pool can route their browser traffic through the relay's internet connection. The relay must also have tunnel-exit turned on in its server config for this to take effect.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .background(Color.gray.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Relay Tunnel Card (Member)
+
+/// Member-side card that lets the user opt in to tunnel their device traffic through the
+/// pool host. Visible only when (a) we are a member of a remote pool, and (b) the host has
+/// enabled `tunnelExitEnabled`. The card delegates the actual `ProxyManager.startRelayMode`
+/// call to the host app via `viewModel.onStartMemberRelayMode` so this package stays free
+/// of a `Core` dependency.
+private struct RelayTunnelCard: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: viewModel.memberRelayActive ? "shield.checkerboard" : "shield.lefthalf.filled")
+                    .foregroundStyle(viewModel.memberRelayActive ? Color.green : Color.accentColor)
+                Text("Tunnel Through Host")
+                    .font(.headline)
+                Spacer()
+            }
+
+            if viewModel.memberRelayActive {
+                if let name = viewModel.memberRelayHostName {
+                    Text("Tunnelling through \(name)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Tunnelling active")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Button(role: .destructive) {
+                    Task { await viewModel.onStopMemberRelayMode?() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if viewModel.memberRelayPending {
+                            ProgressView().controlSize(.small)
+                            Text("Disconnecting…")
+                        } else {
+                            Text("Stop Tunnelling")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.memberRelayPending)
+            } else {
+                Text("Route your browser traffic through the relay server. Useful when you want a different exit IP than your home network.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                // Per-pool approval is the *member* gate — the host always passes it locally.
+                if !viewModel.isHost && !viewModel.hostTunnelExitEnabled {
+                    Label("The host hasn't enabled relay exit yet. Ask them to turn it on in Pool Settings.", systemImage: "info.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    Task { await viewModel.onStartMemberRelayMode?() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if viewModel.memberRelayPending {
+                            ProgressView().controlSize(.small).tint(.white)
+                            Text("Connecting to relay…")
+                        } else {
+                            Text("Tunnel My Traffic Through Relay")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    (!viewModel.isHost && !viewModel.hostTunnelExitEnabled)
+                        || viewModel.memberRelayPending
+                )
+            }
+        }
+        .padding()
+        .background(Color.gray.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
 
 private struct ConnectionStatusCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
@@ -1352,6 +1551,12 @@ private struct QuickActionsCard: View {
 
             // Remote mode invitation actions (available to any connected member)
             if viewModel.transportMode == .remote {
+                // The host's own client can always issue invitations — their own auth is
+                // the gate, and if they're sitting in front of the UI, they're online.
+                // Members can only request invitation links while the host is online,
+                // since the relay needs the host to approve new joins.
+                let inviteDisabled = !viewModel.isHost && !viewModel.hostOnline
+
                 // Create/request invitation link
                 Button {
                     viewModel.requestInviteLink()
@@ -1365,9 +1570,17 @@ private struct QuickActionsCard: View {
                         Image(systemName: "chevron.right")
                     }
                     .padding()
-                    .background(Color.green.opacity(0.1))
-                    .foregroundStyle(.green)
+                    .background((inviteDisabled ? Color.gray : Color.green).opacity(0.1))
+                    .foregroundStyle(inviteDisabled ? Color.gray : Color.green)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .disabled(inviteDisabled)
+
+                if inviteDisabled {
+                    Text("Host must be online to issue invitations.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
                 }
 
                 // Active invitations list (host only)
@@ -1666,6 +1879,10 @@ private struct HostSettingsSheet: View {
                     Toggle("Require Encryption", isOn: $viewModel.requireEncryption)
                     Toggle("Auto-accept Join Requests", isOn: $viewModel.autoAcceptPeers)
                 }
+
+                // Note: the relay-exit toggle lives on the main pool detail page in
+                // `TunnelExitHostCard`. The duplicate that used to live here was removed
+                // so there is one canonical entry point.
             }
             .navigationTitle("Pool Settings")
             .crossPlatformInlineNavigationTitle()

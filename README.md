@@ -56,6 +56,12 @@ Zero external dependencies. Everything ships in one Swift package.
 - **Relay bridge deduplication** — Messages bridged between relay and primary sessions are deduplicated by `PoolMessage.id` to prevent double processing
 - **1 MB WebSocket frame limit** — Incoming WebSocket frames exceeding 1 MB are dropped before processing to prevent memory exhaustion from malicious servers
 - **Cloudflare Tunnel support** — Production deployment via `cloudflared` for TLS termination without managing certificates
+- **Pool persistence past host disconnect** — When the pool host's WebSocket drops, the pool stays alive on the relay; existing peers keep messaging, calling, gaming, and tunneling. The host re-authenticates with the same Ed25519 key + `pool_id` to rebind in place. New joins are still gated on the host being online (no auto-approve). Surfaced via `ConnectionPoolManager.hostOnline` and the `pool_host_status` server frame
+- **Host-offline join rejection** — Join requests received while the host is offline are rejected with `JoinRejected.reason == "host_offline_unavailable"` and surfaced as `TransportError.hostOffline` to a friendly user message — auto-reconnect is suppressed on this path so devices don't hammer the relay with rejections
+- **Tunnel-exit (VPN-like) client** — `RelayTunnelClient` opens TCP/UDP streams through the relay so the relay's IP becomes the visible exit address. Used by StealthOS's in-app proxy to route browser traffic; TLS to the destination remains end-to-end (relay sees only ciphertext). Per-pool host approval gate via `update_pool_config { tunnel_exit_enabled }`; the host bypasses their own gate
+- **Binary hot-path frames** — `TUNNEL_DATA` (`0x01`) and `TUNNEL_UDP` (`0x02`) ride binary WebSocket frames with a fixed-size big-endian header (no base64, no JSON parse on the byte path). Control plane (open / close / window_update / dns / error) stays JSON for debuggability
+- **Credit-based flow control** — Per-stream send-credit window (256 KiB initial; relay grants additional credit via `tunnel_window_update` as it consumes bytes). Stops the WebSocket from getting evicted by the relay's slow-consumer threshold under sustained traffic
+- **Tunnel kill switch** — A `tunnel_close { reason: "policy_denied" }` from the relay (server flag off, per-pool flag off, denied CIDR/port) trips a `RelayTunnelKillSwitchTriggered` notification consumers can hook to block all egress until the user resolves it
 
 ## Architecture
 
@@ -206,6 +212,42 @@ All received data — on both the primary `MCSessionDelegate` and the relay sess
 
 Relay discovery operates on a distinct Bonjour service type to prevent DTLS handshake state from colliding with the primary session. The relay session uses its own `MCSession`, `MCPeerID`, and delegate handler, fully isolated from the primary connection.
 
+### Pool Persistence Across Host Disconnect
+
+The relay decouples pool authority from host presence: the pool's identity is the bound Ed25519 public key, not the host's current WebSocket connection. When the host's connection drops, the relay marks the pool host-offline (broadcasting `pool_host_status { online: false, offline_since }`) but keeps the pool, peers, invitations, and per-pool config in place. The host's session token is wiped so a leaked token can't be replayed.
+
+The host reclaims the pool by re-running `host_auth` with the same Ed25519 key and the same `pool_id` — the relay rebinds in place and emits `pool_host_status { online: true }`. A `host_auth` with a different pubkey targeting the same `pool_id` is rejected with `403 pool host pubkey mismatch`. New invitations and join approvals still require the host to be live (no auto-approve) — `JoinRequest` while host-offline returns `JoinRejected.reason = "host_offline_unavailable"`.
+
+A 60-second eviction sweep destroys pools whose host has been offline longer than `[pool] host_offline_ttl_secs` (default 24h) or that are simultaneously empty + host-offline for `empty_grace_secs` (default 5min). Targeted forwards to an offline host buffer in the existing per-peer queue and replay on rebind.
+
+### Tunnel Exit (VPN-like)
+
+The relay can act as a network exit for authenticated pool members — opening real TCP/UDP sockets to internet destinations and bridging bytes back over the WebSocket. Three gates apply on every `tunnel_open`:
+
+1. **Server-wide** — the relay operator must set `[tunnel] enabled = true`.
+2. **Per-pool** — the pool host approves members via `update_pool_config { tunnel_exit_enabled: true }`. The host themselves bypasses this gate; it controls *member* access.
+3. **Authentication** — the connection must have completed `host_auth_success` or `join_accepted`.
+
+Failures at any gate respond with `tunnel_close { reason: "policy_denied" }`. The relay also default-denies SSRF-prone targets (RFC1918, loopback, link-local, ULA) and abuse-prone ports (SMTP / IRC) — operators can override.
+
+Bulk bytes ride binary WebSocket frames on the same port (no second listener, no proxy reconfiguration):
+
+```
+TUNNEL_DATA   [0x01][stream_id u32 BE][sequence u32 BE][payload ≤ 32 KiB]
+TUNNEL_UDP    [0x02][stream_id u32 BE][datagram]
+```
+
+Type byte `0x00` is reserved as a framing-error sentinel and `0x80..=0xFF` is reserved for future channels — both rejected. Binary frames received before authentication terminate the WebSocket with code `1008 policy violation`. The control plane (`tunnel_open`, `tunnel_close`, `tunnel_window_update`, `tunnel_dns_query`, `tunnel_dns_response`, `tunnel_error`) stays JSON for debuggability.
+
+What the relay can and cannot see when acting as an exit:
+
+| Data | Visible to Relay? | Notes |
+|------|-------------------|-------|
+| Destination hostname / port | Yes | Required for the upstream connect |
+| TCP / UDP byte counts and timing | Yes | Inherent in the bridge |
+| **HTTPS payload (TLS body)** | **No** | TLS is end-to-end member↔destination |
+| Plain HTTP body | Yes | Plain HTTP is unencrypted by design |
+
 ## Installation
 
 ### Swift Package Manager
@@ -214,7 +256,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Olib-AI/ConnectionPool.git", from: "1.4.0")
+    .package(url: "https://github.com/Olib-AI/ConnectionPool.git", from: "1.5.0")
 ]
 ```
 
@@ -392,6 +434,57 @@ viewModel.joinViaInvitation()
 manager.disconnect()
 ```
 
+### Tunnel-Exit Through the Relay
+
+When the relay is configured with `[tunnel] enabled = true` and the pool host has approved tunnel exit, any pool member can route TCP/UDP traffic through the relay's network. The relay's IP becomes the visible exit address; TLS to the destination stays end-to-end.
+
+```swift
+import ConnectionPool
+
+// Host-side: approve members to use the relay as an exit. The host bypasses
+// this flag for their own traffic — it gates members.
+try await manager.setTunnelExitEnabled(true)
+
+// Member-side (or host using their own approved relay): construct a client
+// against the active WebSocketTransport, then open streams.
+let client = RelayTunnelClient(
+    transport: manager.remoteTransport!,
+    availabilityProvider: { @Sendable in
+        await MainActor.run {
+            manager.remoteTransport != nil
+                && (manager.isHost || manager.hostTunnelExitEnabled)
+        }
+    }
+)
+
+let stream = try await client.openStream(
+    to: .hostname(host: "example.com", port: 443),
+    network: .tcp
+)
+try await stream.send(httpsClientHello)
+for try await chunk in stream.receive {
+    // ciphertext — TLS is end-to-end with example.com
+}
+await stream.close()
+```
+
+The relay rejects `tunnel_open` with `tunnel_close { reason: "policy_denied" }` when the server-wide flag is off, the per-pool flag is off (members only), the destination is in the relay's CIDR/port deny list, or the connection isn't authenticated to a pool. `policy_denied` posts `RelayTunnelKillSwitchTriggered` so the host app can drive a kill-switch UI.
+
+### Host-Offline Behavior
+
+The pool persists when the host's WebSocket drops. Members keep chatting, calling, gaming, and tunneling. Observe the published state to drive a UI pill:
+
+```swift
+manager.$hostOnline.combineLatest(manager.$hostOfflineSince)
+    .sink { online, since in
+        if !online, let since {
+            print("Host offline since \(since)")
+        }
+    }
+```
+
+While the host is offline, new join attempts surface as `TransportError.hostOffline` ("The pool host is currently offline. Try again later."). The host re-authenticating with the same Ed25519 identity and `pool_id` rebinds to the existing pool — no fresh `pool_id` is issued, members reconnect transparently.
+
 ## Self-Hosting the Relay Server
 
 The relay server is a standalone Rust project: [StealthRelay](https://github.com/Olib-AI/StealthRelay)
@@ -467,9 +560,11 @@ When set, `RemotePoolState` persists through this provider instead of plain `Use
 | `MeshRelayService` | Coordinates multi-hop message routing, topology broadcasts, deduplication, and HMAC verification. |
 | `MultiplayerGameService` | Session management for multiplayer games: invitations, ready checks, state sync, forfeit, disconnect recovery. |
 | `DeviceBlockListService` | Persistent block list with pluggable storage backend. |
-| `WebSocketTransport` | WebSocket-based transport for remote relay mode. Handles HostAuth, JoinRequest, PoW solving, heartbeats, and automatic reconnection. |
+| `WebSocketTransport` | WebSocket-based transport for remote relay mode. Handles HostAuth, JoinRequest, PoW solving, heartbeats, automatic reconnection, and binary tunnel frames. |
 | `RemotePoolService` | Manages host Ed25519 identity (Keychain-stored), invitation creation/parsing, and QR code generation. |
 | `ConnectionPoolViewModel` | SwiftUI-ready view model bridging both local and remote transport modes. |
+| `RelayTunnelClient` | Actor that opens TCP/UDP streams through the relay (tunnel-exit / VPN-like). Per-stream credit-based flow control, monotonic stream IDs, async-stream-based receive, DNS query continuations. |
+| `TunnelStream` | Bidirectional byte pipe for one tunnel stream. `send(_:)`, `receive` (`AsyncThrowingStream<Data, Error>`), `close()`. |
 
 ### Models
 
@@ -489,8 +584,12 @@ When set, `RemotePoolState` persists through this provider instead of plain `Use
 | `RemoteInvitation` | An active invitation with token ID, shareable URL, expiry, and max uses. |
 | `ParsedInvitation` | Decoded invitation URL fields: pool ID, token secret, server address, host fingerprint. |
 | `RemoteHostIdentity` | Ed25519 signing identity for the pool host (Keychain-stored private key). |
-| `ServerFrame` | All WebSocket frame types for client-server communication (HostAuth, Forward, JoinRequest, etc.). |
+| `ServerFrame` | All WebSocket frame types for client-server communication (HostAuth, Forward, JoinRequest, tunnel control plane, `pool_host_status`, etc.). |
 | `BlockedDevice` | A blocked device entry with peer ID, display name, reason, and timestamp. |
+| `TunnelDestination` | Tagged union of `.hostname(host:port:)`, `.ipv4(address:port:)`, `.ipv6(address:port:)` for `tunnel_open`. |
+| `PoolHostStatusData` | Payload of the `pool_host_status` server frame: `online: Bool`, `offlineSince: Int64?`. |
+| `TunnelOpenData` / `TunnelCloseData` / `TunnelWindowUpdateData` / `TunnelDnsQueryData` / `TunnelDnsResponseData` / `TunnelErrorData` | Tunnel control-plane frame payloads. Field names mirror the wire JSON exactly. |
+| `TunnelLimits` | Hot-path constants: `maxDataChunkBytes` (32 KiB), `initialReceiveWindow` (256 KiB), `windowUpdateThreshold` (64 KiB), `connectTimeoutSeconds` (15s). |
 
 ### Protocols
 
@@ -499,6 +598,7 @@ When set, `RemotePoolState` persists through this provider instead of plain `Use
 | `ConnectionPoolLogger` | Inject custom logging. Receives message, level, category, file, function, line. |
 | `BlockListStorageProvider` | Pluggable persistence for the device block list (save/load `Data` by key). |
 | `PoolAppLifecycle` | Lifecycle hooks: activate, background, suspend, terminate, memory warning. |
+| `RelayTunnelClientType` | Public surface of `RelayTunnelClient`: `openStream`, `resolveDNS`, `isAvailable`, `hostPeerID`. Lets app code abstract over the concrete actor for testing or alternate transports. |
 
 ### Enumerations
 
@@ -511,6 +611,11 @@ When set, `RemotePoolState` persists through this provider instead of plain `Use
 | `PeerEvent` | `.connected(Peer)`, `.disconnected(Peer)` |
 | `PoolLogLevel` | `.debug`, `.info`, `.warning`, `.error`, `.critical` |
 | `PoolLogCategory` | `.general`, `.network`, `.runtime`, `.games` |
+| `TunnelNetwork` | `.tcp`, `.udp` |
+| `TunnelCloseReason` | `.peerClosed`, `.aborted`, `.idleTimeout`, `.policyDenied`, `.destinationUnreachable`, `.connectionRefused`, `.timeout`, `.streamLimit`, `.protocolError` |
+| `DnsRecordType` | `.a`, `.aaaa`, `.cname`, `.txt` |
+| `TunnelErrorCode` | `.policyDenied`, `.destinationUnreachable`, `.connectionRefused`, `.timeout`, `.protocolError`, `.resourceExhausted` |
+| `TransportError` | `.notConnected`, `.invalidPoolCode`, `.peerNotFound`, `.encryptionFailed`, `.serializationFailed`, `.peerBlocked`, `.connectionFailed(Error)`, `.invalidConfiguration`, `.poolFull`, `.unsupportedOperation`, `.authenticationFailed(String)`, `.hostOffline` |
 
 ## Requirements
 

@@ -144,6 +144,11 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
     /// The server has not been claimed yet and requires a one-time claim code.
     case serverUnclaimed
 
+    /// The relay rejected a join request because the pool host's WebSocket is currently
+    /// offline. The pool itself is still alive (relay v0.5.0+ keeps it running past a
+    /// host disconnect), but new joins require an online host to approve them.
+    case hostOffline
+
     /// An underlying system error occurred.
     case underlying(WrappedError)
 
@@ -158,6 +163,7 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
         case .protocolMismatch: return "Protocol version mismatch"
         case .kicked: return "Kicked from pool"
         case .serverUnclaimed: return "Server not yet claimed"
+        case .hostOffline: return "The pool host is currently offline. Try again later."
         case .underlying(let wrapped): return "Error: \(wrapped.message)"
         }
     }
@@ -174,7 +180,8 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
              (.sessionExpired, .sessionExpired),
              (.protocolMismatch, .protocolMismatch),
              (.kicked, .kicked),
-             (.serverUnclaimed, .serverUnclaimed):
+             (.serverUnclaimed, .serverUnclaimed),
+             (.hostOffline, .hostOffline):
             return true
         case (.underlying(let a), .underlying(let b)):
             return a.message == b.message

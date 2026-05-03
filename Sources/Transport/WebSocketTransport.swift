@@ -665,6 +665,9 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             return .joinApproval(data)
         case .closePool:
             return .closePool(ClosePoolData(sessionToken: token))
+        case .updatePoolConfig(var data):
+            data.sessionToken = token
+            return .updatePoolConfig(data)
         default:
             return frame
         }
@@ -926,27 +929,31 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                     guard !Task.isCancelled else { break }
 
                     await MainActor.run {
-                        let data: Data
                         switch message {
                         case .data(let d):
-                            data = d
+                            // Drop oversized frames to prevent memory exhaustion from malicious servers.
+                            guard d.count <= Self.maxWebSocketFrameSize else {
+                                self.logMessage("[SECURITY] Dropping oversized binary WebSocket frame: \(d.count) bytes exceeds \(Self.maxWebSocketFrameSize) byte limit")
+                                return
+                            }
+                            self.handleBinaryFrame(d)
+
                         case .string(let s):
-                            data = Data(s.utf8)
+                            let data = Data(s.utf8)
+                            // Drop oversized frames to prevent memory exhaustion from malicious servers.
+                            guard data.count <= Self.maxWebSocketFrameSize else {
+                                self.logMessage("[SECURITY] Dropping oversized text WebSocket frame: \(data.count) bytes exceeds \(Self.maxWebSocketFrameSize) byte limit")
+                                return
+                            }
+                            do {
+                                let frame = try ServerFrame.fromJSON(data)
+                                self.handleFrame(frame)
+                            } catch {
+                                self.logMessage("Frame decode error: \(error.localizedDescription)")
+                            }
+
                         @unknown default:
                             return
-                        }
-
-                        // Drop oversized frames to prevent memory exhaustion from malicious servers
-                        guard data.count <= Self.maxWebSocketFrameSize else {
-                            self.logMessage("[SECURITY] Dropping oversized WebSocket frame: \(data.count) bytes exceeds \(Self.maxWebSocketFrameSize) byte limit")
-                            return
-                        }
-
-                        do {
-                            let frame = try ServerFrame.fromJSON(data)
-                            self.handleFrame(frame)
-                        } catch {
-                            self.logMessage("Frame decode error: \(error.localizedDescription)")
                         }
                     }
                 } catch {
@@ -991,6 +998,15 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             updateState(.advertising)
             startHeartbeat()
 
+            // The host has just authenticated — by definition the host is online. Seed
+            // the ViewModel's `hostOnline` here so a host who reconnected after a drop
+            // (relay v0.5.0 rebind path) sees their own pool flip back to online without
+            // waiting for the broadcast `pool_host_status` frame.
+            delegate?.transport(self, didReceivePoolHostStatus: PoolHostStatusData(
+                online: true,
+                offlineSince: nil
+            ))
+
         case .joinAccepted(let data):
             sessionToken = data.sessionToken
             localPeerID = data.peerId
@@ -998,6 +1014,21 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             reconnectAttempt = 0
             updateState(.connected)
             startHeartbeat()
+
+            // Surface the host's tunnel-exit flag immediately so member UIs
+            // can decide whether to offer the relay-tunnel toggle.
+            delegate?.transport(self, didReceivePoolConfigUpdate: PoolConfigUpdatedData(
+                tunnelExitEnabled: data.poolInfo.tunnelExitEnabled,
+                updatedByHost: true
+            ))
+
+            // Surface the host's liveness flag so the ViewModel seeds `hostOnline`.
+            // Legacy relays missing the field decode `host_online == true` (see
+            // ``ServerPoolInfo`` decoder), so this is always safe to forward.
+            delegate?.transport(self, didReceivePoolHostStatus: PoolHostStatusData(
+                online: data.poolInfo.hostOnline,
+                offlineSince: nil
+            ))
 
             // Register existing peers
             for peerInfo in data.peers {
@@ -1013,9 +1044,24 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             }
 
         case .joinRejected(let data):
-            updateState(.failed(.authenticationFailed))
+            // Map the relay's reason string onto a typed transport error so the UI can
+            // surface a friendly message. As of relay v0.5.0 the relay rejects new joins
+            // with `host_offline_unavailable` while the pool host's WebSocket is down —
+            // the pool itself is still alive, but new joins require host approval.
+            //
+            // Suppress reconnection on the host-offline path: a relay that is rejecting
+            // joins because the host is offline will keep rejecting them every time we
+            // reconnect, draining battery for no progress. The user can retry manually.
             logMessage("Join rejected: \(data.reason)")
-            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            let mapped: TransportError
+            if data.reason == "host_offline_unavailable" {
+                mapped = .hostOffline
+                intentionalDisconnect = true
+            } else {
+                mapped = .authenticationFailed
+            }
+            updateState(.failed(mapped))
+            delegate?.transport(self, didFailWithError: mapped)
 
         case .peerJoined(let data):
             let peer = TransportPeer(
@@ -1105,6 +1151,17 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             if lowerMessage.contains("not yet claimed") || lowerMessage.contains("unclaimed") || lowerMessage.contains("not claimed") {
                 serverIsUnclaimed = true
                 transportError = .serverUnclaimed
+            } else if data.code == 403 && lowerMessage.contains("pubkey mismatch") {
+                // Host tried to rebind to an existing pool with a different identity (e.g.
+                // app reinstalled, keychain wiped). Suppress reconnect so we don't loop on
+                // the same rejection, and surface a clear message that points at the
+                // recovery-key flow.
+                intentionalDisconnect = true
+                transportError = .from(NSError(
+                    domain: "ServerFrame",
+                    code: 403,
+                    userInfo: [NSLocalizedDescriptionKey: "Cannot reclaim pool — host identity changed. Use the recovery key flow."]
+                ))
             } else {
                 switch data.code {
                 case 401: transportError = .authenticationFailed
@@ -1142,13 +1199,78 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             logMessage("Server claim rejected: \(data.reason)")
             delegate?.transport(self, didFailWithError: .authenticationFailed)
 
+        case .poolConfigUpdated(let data):
+            // Server announced a pool-level config change. Update cached snapshot and notify delegate.
+            if var info = currentPoolInfo {
+                info = ServerPoolInfo(
+                    poolId: info.poolId,
+                    name: info.name,
+                    hostPeerId: info.hostPeerId,
+                    maxPeers: info.maxPeers,
+                    currentPeers: info.currentPeers,
+                    tunnelExitEnabled: data.tunnelExitEnabled,
+                    hostOnline: info.hostOnline
+                )
+                currentPoolInfo = info
+            }
+            delegate?.transport(self, didReceivePoolConfigUpdate: data)
+
+        case .poolHostStatus(let data):
+            // Server announced that the pool host's WebSocket dropped (or came back).
+            // Mirror the new flag onto the cached PoolInfo snapshot so anyone reading
+            // `currentPoolInfo` sees a consistent value, then notify the delegate so the
+            // ViewModel can flip its `@Published var hostOnline`.
+            if var info = currentPoolInfo {
+                info = ServerPoolInfo(
+                    poolId: info.poolId,
+                    name: info.name,
+                    hostPeerId: info.hostPeerId,
+                    maxPeers: info.maxPeers,
+                    currentPeers: info.currentPeers,
+                    tunnelExitEnabled: info.tunnelExitEnabled,
+                    hostOnline: data.online
+                )
+                currentPoolInfo = info
+            }
+            delegate?.transport(self, didReceivePoolHostStatus: data)
+
+        case .tunnelClose, .tunnelWindowUpdate, .tunnelDnsResponse, .tunnelError:
+            // Tunnel control-plane frames addressed to this client. The relay-tunnel client
+            // is the sole consumer; the default delegate implementation drops them.
+            delegate?.transport(self, didReceiveTunnelFrame: frame)
+
+        case .tunnelOpen, .tunnelDnsQuery:
+            // These are client-to-server tunnel frames; should not be received from the relay.
+            logMessage("Unexpected client->server tunnel frame received from server")
+
         case .hostAuth, .joinRequest, .forward, .kickPeer,
              .createInvitation, .revokeInvitation, .joinApproval,
              .ack, .closePool, .handshakeInit, .heartbeatPing,
-             .claimServer:
+             .claimServer, .updatePoolConfig:
             // These are client-to-server frames; should not be received from server.
             logMessage("Unexpected client->server frame received from server")
         }
+    }
+
+    /// Handle a binary WebSocket frame. Currently only `tunnel_data` (0x01) and
+    /// `tunnel_udp` (0x02) are defined; anything else is dropped at the transport boundary.
+    /// The framing-error sentinel (0x00) and reserved range (0x80...0xFF) are rejected by
+    /// the parser. Unknown but well-formed types are dropped here; protocol_error replies
+    /// are emitted by the consuming RelayTunnelClient layer where stream context exists.
+    private func handleBinaryFrame(_ bytes: Data) {
+        guard let decoded = decodeTunnelBinary(bytes) else {
+            // Empty / short / reserved-type frame. Silently drop — the relay should not
+            // be sending these. Log at debug for diagnostics.
+            log("[TUNNEL] Dropping malformed binary frame (\(bytes.count) bytes)", level: .debug, category: .network)
+            return
+        }
+        delegate?.transport(
+            self,
+            didReceiveBinaryTunnelFrame: decoded.type.rawValue,
+            streamID: decoded.streamID,
+            sequence: decoded.sequence,
+            payload: decoded.payload
+        )
     }
 
     /// Handle a WebSocket connection loss.
@@ -1234,6 +1356,54 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             maxUses: maxUses,
             expiresInSecs: expiresInSecs
         )))
+    }
+
+    /// Host-only: send an `update_pool_config` frame to the relay to toggle pool-level flags.
+    ///
+    /// `injectSessionToken` automatically attaches the host session token before send. The relay
+    /// will respond with a `pool_config_updated` broadcast that the manager applies to local state.
+    public func sendUpdatePoolConfig(tunnelExitEnabled: Bool?) {
+        sendFrame(.updatePoolConfig(UpdatePoolConfigData(
+            tunnelExitEnabled: tunnelExitEnabled
+        )))
+    }
+
+    // MARK: - Tunnel Send Surface
+    //
+    // Member-side `RelayTunnelClient` calls into these methods to push tunnel control-plane
+    // frames (JSON text) and hot-path data/UDP (binary) across the WebSocket.
+
+    /// Send any `ServerFrame` as a JSON text frame. Public so `RelayTunnelClient` can
+    /// emit `tunnelOpen` / `tunnelClose` / `tunnelWindowUpdate` / `tunnelDnsQuery`.
+    public func sendServerFrame(_ frame: ServerFrame) {
+        sendFrame(frame)
+    }
+
+    /// Send a raw binary WebSocket frame.
+    public func sendBinary(_ bytes: Data) {
+        guard let task = webSocketTask else {
+            logMessage("sendBinary: webSocketTask is nil, dropping \(bytes.count)-byte frame")
+            return
+        }
+        let message = URLSessionWebSocketTask.Message.data(bytes)
+        task.send(message) { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    self.logMessage("sendBinary error: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Convenience: build a `TUNNEL_DATA` binary frame and send it.
+    public func sendTunnelDataBinary(streamID: UInt32, sequence: UInt32, payload: Data) {
+        sendBinary(encodeTunnelData(streamID: streamID, sequence: sequence, payload: payload))
+    }
+
+    /// Convenience: build a `TUNNEL_UDP` binary frame and send it.
+    public func sendTunnelUdpBinary(streamID: UInt32, payload: Data) {
+        sendBinary(encodeTunnelUdp(streamID: streamID, payload: payload))
     }
 
     // MARK: - Claim Frame Listener

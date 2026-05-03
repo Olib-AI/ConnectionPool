@@ -165,4 +165,59 @@ public protocol TransportDelegate: AnyObject, Sendable {
     ///   - transport: The transport reporting the error.
     ///   - didFailWithError: The error that occurred.
     func transport(_ transport: any TransportProvider, didFailWithError error: TransportError)
+
+    /// Called when the relay broadcasts a pool-configuration update (e.g. tunnel-exit toggled).
+    ///
+    /// Default implementation does nothing — only consumers that care about pool-level config
+    /// changes (e.g. ``ConnectionPoolViewModel``, the relay-tunnel UI) need to override.
+    func transport(_ transport: any TransportProvider, didReceivePoolConfigUpdate update: PoolConfigUpdatedData)
+
+    /// Called when the relay broadcasts a pool host liveness update.
+    ///
+    /// Default implementation does nothing — only ``ConnectionPoolViewModel`` cares so it can
+    /// surface a "Host offline" pill and disable invitation creation while the host is gone.
+    /// Existing chat / call / game / tunnel data paths intentionally ignore this event so
+    /// pool activity continues uninterrupted past a host disconnect (relay v0.5.0+).
+    func transport(_ transport: any TransportProvider, didReceivePoolHostStatus status: PoolHostStatusData)
+
+    /// Called when a JSON-encoded tunnel control-plane frame arrives.
+    ///
+    /// The relay-tunnel client (`RelayTunnelClient`) is the sole consumer. Default
+    /// implementation drops the frame so existing delegates (e.g. ``ConnectionPoolViewModel``)
+    /// remain unaffected by tunnel traffic.
+    func transport(_ transport: any TransportProvider, didReceiveTunnelFrame frame: ServerFrame)
+
+    /// Called when a binary tunnel frame arrives (`tunnel_data` or `tunnel_udp`).
+    ///
+    /// Hot-path bytes — delivered straight from the WebSocket receive loop without copying
+    /// through JSON. The relay-tunnel client matches `streamID` to its open streams.
+    /// Default implementation drops the frame.
+    ///
+    /// - Parameters:
+    ///   - type: `0x01` (data) or `0x02` (udp).
+    ///   - streamID: u32 stream identifier.
+    ///   - sequence: present for `tunnel_data`; `nil` for `tunnel_udp`.
+    ///   - payload: opaque bytes.
+    func transport(_ transport: any TransportProvider, didReceiveBinaryTunnelFrame type: UInt8,
+                   streamID: UInt32, sequence: UInt32?, payload: Data)
+}
+
+public extension TransportDelegate {
+    func transport(_ transport: any TransportProvider, didReceivePoolConfigUpdate update: PoolConfigUpdatedData) {
+        // Default no-op so existing conformers don't break.
+    }
+
+    func transport(_ transport: any TransportProvider, didReceivePoolHostStatus status: PoolHostStatusData) {
+        // Default no-op so existing conformers (e.g. RelayTunnelClient internals) ignore
+        // host-liveness events. Only ``ConnectionPoolViewModel`` needs to react.
+    }
+
+    func transport(_ transport: any TransportProvider, didReceiveTunnelFrame frame: ServerFrame) {
+        // Default no-op — only the relay-tunnel client cares.
+    }
+
+    func transport(_ transport: any TransportProvider, didReceiveBinaryTunnelFrame type: UInt8,
+                   streamID: UInt32, sequence: UInt32?, payload: Data) {
+        // Default no-op — only the relay-tunnel client cares.
+    }
 }

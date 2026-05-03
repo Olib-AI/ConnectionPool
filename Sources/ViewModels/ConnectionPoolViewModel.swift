@@ -108,6 +108,62 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     @Published public private(set) var currentSession: PoolSession?
     @Published public private(set) var isHost: Bool = false
 
+    /// Mirror of `ConnectionPoolManager.hostTunnelExitEnabled`. Read-only for the UI.
+    @Published public private(set) var hostTunnelExitEnabled: Bool = false
+
+    /// Mirror of `ConnectionPoolManager.hostOnline`. Drives the "Host offline" pill and
+    /// the disabled state of the "Invite a Friend" action.
+    @Published public private(set) var hostOnline: Bool = true
+
+    /// Mirror of `ConnectionPoolManager.hostOfflineSince`. Used to render the relative
+    /// "12 min ago" timestamp in the host-offline pill.
+    @Published public private(set) var hostOfflineSince: Date?
+
+    /// Whether the local user (member) has currently activated relay-tunnel mode.
+    /// Set by the host app (where `ProxyManager` lives) via `setMemberRelayActive`.
+    @Published public private(set) var memberRelayActive: Bool = false
+
+    /// Display name of the host the member is currently tunnelling through (for the status pill).
+    @Published public private(set) var memberRelayHostName: String?
+
+    /// `true` while the start/stop relay-mode operation is in flight. The card uses this to
+    /// show a spinner and disable the toggle until the host app's async transition completes.
+    @Published public private(set) var memberRelayPending: Bool = false
+
+    /// Hooks the host app installs so the ConnectionPool UI can call into Core's `ProxyManager`
+    /// without ConnectionPool taking a direct dependency on Core.
+
+    /// Invoked when the member taps "Tunnel my traffic through host". The implementer should:
+    ///   1. Build a `RelayTunnelClient` using the active pool's per-peer ECDH key.
+    ///   2. Call `ProxyManager.shared.startRelayMode(...)` with that client.
+    ///   3. Update `memberRelayActive` via `setMemberRelayActive(true, hostName:)`.
+    public var onStartMemberRelayMode: (@MainActor () async -> Void)?
+
+    /// Invoked when the member taps "Stop tunnelling". The implementer should call
+    /// `ProxyManager.shared.stopRelayMode()` and then `setMemberRelayActive(false, ...)`.
+    public var onStopMemberRelayMode: (@MainActor () async -> Void)?
+
+    /// Forwards inbound JSON tunnel control-plane frames (close / window_update / dns_response /
+    /// error) to the active `RelayTunnelClient`. Installed by the host app when relay mode starts;
+    /// cleared on stop. Called from the WebSocket transport delegate path.
+    public var relayTunnelFrameForwarder: (@Sendable (ServerFrame) -> Void)?
+
+    /// Forwards inbound binary tunnel frames (`tunnel_data` / `tunnel_udp`) to the active
+    /// `RelayTunnelClient`. Same lifecycle as `relayTunnelFrameForwarder`.
+    public var relayTunnelBinaryForwarder: (@Sendable (UInt8, UInt32, UInt32?, Data) -> Void)?
+
+    /// Called by the host app to keep the relay-mode UI state in sync with `ProxyManager`.
+    public func setMemberRelayActive(_ active: Bool, hostName: String? = nil) {
+        memberRelayActive = active
+        memberRelayHostName = active ? hostName : nil
+    }
+
+    /// Called by the host app to flag a relay-mode start/stop as in flight. The UI shows a
+    /// progress indicator while this is `true`.
+    public func setMemberRelayPending(_ pending: Bool) {
+        memberRelayPending = pending
+    }
+
     // MARK: - Private Properties
 
     private var cancellables = Set<AnyCancellable>()
@@ -340,6 +396,42 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
                 self?.handlePeerEvent(event)
             }
             .store(in: &cancellables)
+
+        // Mirror tunnel-exit flag from the manager so the UI can show host/member toggles.
+        poolManager.$hostTunnelExitEnabled
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in
+                self?.hostTunnelExitEnabled = enabled
+            }
+            .store(in: &cancellables)
+
+        // Mirror host-online liveness flags so the lobby can react in real time.
+        poolManager.$hostOnline
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] online in
+                self?.hostOnline = online
+            }
+            .store(in: &cancellables)
+
+        poolManager.$hostOfflineSince
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] since in
+                self?.hostOfflineSince = since
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Tunnel Exit (Host)
+
+    /// Host action: change the pool-level tunnel-exit flag. Routed through
+    /// `ConnectionPoolManager.setTunnelExitEnabled(_:)` which sends an `update_pool_config`
+    /// frame and waits for the server's confirmation broadcast.
+    public func setHostTunnelExitEnabled(_ value: Bool) async {
+        do {
+            try await poolManager.setTunnelExitEnabled(value)
+        } catch {
+            showError(message: error.localizedDescription)
+        }
     }
 
     // MARK: - PoolAppLifecycle Protocol
@@ -1260,6 +1352,10 @@ extension ConnectionPoolViewModel: TransportDelegate {
             // does not route messages through the failed WebSocket.
             poolManager.remoteTransport = nil
             poolManager.remotePeerID = nil
+            // If relay-tunnel mode was active, tear it down — the data path is gone.
+            if memberRelayActive, let stop = onStopMemberRelayMode {
+                Task { await stop() }
+            }
         case .reconnecting:
             break
         case .idle:
@@ -1388,9 +1484,39 @@ extension ConnectionPoolViewModel: TransportDelegate {
             // Claim was rejected by the server.
             isClaimingServer = false
             showError(message: "Claim rejected. Check that the claim code is correct and has not already been used.")
+        case .hostOffline:
+            // Relay v0.5.0+ rejection: the pool is alive but the host is offline and
+            // can't approve new joins. Surface a friendly message and don't auto-retry —
+            // the transport already suppressed reconnection on this path.
+            showError(message: "The pool host is currently offline. Try again later.")
         default:
             showError(message: error.localizedDescription)
         }
+    }
+
+    public func transport(_ transport: any TransportProvider, didReceivePoolConfigUpdate update: PoolConfigUpdatedData) {
+        // Mirror the new flag into the shared manager so observers (relay-tunnel UI, ProxyManager)
+        // see a consistent value regardless of who triggered the change (local host vs remote broadcast).
+        poolManager.updateHostTunnelExitEnabled(update.tunnelExitEnabled)
+        log("Pool config updated: tunnelExitEnabled=\(update.tunnelExitEnabled), updatedByHost=\(update.updatedByHost)", category: .network)
+    }
+
+    public func transport(_ transport: any TransportProvider, didReceivePoolHostStatus status: PoolHostStatusData) {
+        // Mirror host-liveness into the shared manager. Existing data paths (PoolChat, calls,
+        // games, relay tunnel) deliberately ignore this signal — the relay v0.5.0 contract is
+        // that the pool stays alive past a host disconnect, so only the invitation flow and
+        // the host-offline pill consume `hostOnline`.
+        poolManager.updateHostOnline(status.online, offlineSince: status.offlineSince)
+        log("Pool host status: online=\(status.online), offlineSince=\(status.offlineSince.map(String.init) ?? "nil")", category: .network)
+    }
+
+    public func transport(_ transport: any TransportProvider, didReceiveTunnelFrame frame: ServerFrame) {
+        relayTunnelFrameForwarder?(frame)
+    }
+
+    public func transport(_ transport: any TransportProvider, didReceiveBinaryTunnelFrame type: UInt8,
+                          streamID: UInt32, sequence: UInt32?, payload: Data) {
+        relayTunnelBinaryForwarder?(type, streamID, sequence, payload)
     }
 }
 

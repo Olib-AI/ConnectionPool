@@ -104,6 +104,53 @@ public enum ServerFrame: Sendable, Equatable {
 
     /// Server rejected the claim attempt.
     case claimRejected(ClaimRejectedData)
+
+    // MARK: - Tunnel Exit Configuration (client -> server)
+
+    /// Host updates pool-level configuration such as the tunnel-exit feature flag.
+    case updatePoolConfig(UpdatePoolConfigData)
+
+    // MARK: - Tunnel Exit Configuration (server -> client)
+
+    /// Server announces a pool configuration change (e.g. tunnel-exit toggled by host).
+    case poolConfigUpdated(PoolConfigUpdatedData)
+
+    // MARK: - Pool Host Liveness (server -> client)
+
+    /// Server announces that the pool host's WebSocket has gone offline (or come back online).
+    ///
+    /// As of relay v0.5.0, pool state survives a host disconnect — existing guests can
+    /// continue to chat, place calls, play games, and use the relay tunnel exit. New
+    /// joins are still gated on host approval, so the relay rejects fresh `join_request`
+    /// frames with `host_offline_unavailable` while the host is offline. This frame lets
+    /// the iOS client surface a "Host offline" pill and disable invitation creation
+    /// without tearing down the active session.
+    case poolHostStatus(PoolHostStatusData)
+
+    // MARK: - Tunnel Control Plane (bidirectional JSON frames)
+    //
+    // Hot-path tunnel data and UDP datagrams ride the binary WebSocket frames defined in
+    // `TunnelBinaryFrame.swift`. The frames below are the JSON control plane: they open
+    // streams, manage flow-control credit, resolve DNS, tear streams down and surface
+    // errors. Each carries a `data` payload defined in `TunnelTypes.swift`.
+
+    /// Client → server: request to open a new tunnel stream towards a destination.
+    case tunnelOpen(TunnelOpenData)
+
+    /// Bidirectional: tear down a tunnel stream.
+    case tunnelClose(TunnelCloseData)
+
+    /// Bidirectional: grant additional outbound credit on a stream.
+    case tunnelWindowUpdate(TunnelWindowUpdateData)
+
+    /// Client → server: resolve a DNS record through the relay.
+    case tunnelDnsQuery(TunnelDnsQueryData)
+
+    /// Server → client: DNS resolution result for a previously-issued query.
+    case tunnelDnsResponse(TunnelDnsResponseData)
+
+    /// Bidirectional: tunnel-level protocol or policy error.
+    case tunnelError(TunnelErrorData)
 }
 
 // MARK: - Associated Data Types
@@ -134,7 +181,11 @@ public struct HostAuthData: Codable, Sendable, Equatable {
     /// auth to this specific WebSocket connection and prevent replay attacks.
     public let nonce: String
 
-    public init(hostPublicKey: String, timestamp: Int64, signature: String, poolId: UUID, serverUrl: String? = nil, displayName: String? = nil, nonce: String) {
+    /// Whether the host wants tunnel-exit (VPN-like) routing enabled when this pool is created.
+    /// Optional for forward/backward compatibility: legacy hosts and relay servers omit this field.
+    public let tunnelExitEnabled: Bool?
+
+    public init(hostPublicKey: String, timestamp: Int64, signature: String, poolId: UUID, serverUrl: String? = nil, displayName: String? = nil, nonce: String, tunnelExitEnabled: Bool? = nil) {
         self.hostPublicKey = hostPublicKey
         self.timestamp = timestamp
         self.signature = signature
@@ -142,6 +193,7 @@ public struct HostAuthData: Codable, Sendable, Equatable {
         self.serverUrl = serverUrl
         self.displayName = displayName
         self.nonce = nonce
+        self.tunnelExitEnabled = tunnelExitEnabled
     }
 
     enum CodingKeys: String, CodingKey {
@@ -152,6 +204,31 @@ public struct HostAuthData: Codable, Sendable, Equatable {
         case serverUrl = "server_url"
         case displayName = "display_name"
         case nonce
+        case tunnelExitEnabled = "tunnel_exit_enabled"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.hostPublicKey = try container.decode(String.self, forKey: .hostPublicKey)
+        self.timestamp = try container.decode(Int64.self, forKey: .timestamp)
+        self.signature = try container.decode(String.self, forKey: .signature)
+        self.poolId = try container.decode(UUID.self, forKey: .poolId)
+        self.serverUrl = try container.decodeIfPresent(String.self, forKey: .serverUrl)
+        self.displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        self.nonce = try container.decode(String.self, forKey: .nonce)
+        self.tunnelExitEnabled = try container.decodeIfPresent(Bool.self, forKey: .tunnelExitEnabled)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(hostPublicKey, forKey: .hostPublicKey)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(signature, forKey: .signature)
+        try container.encode(poolId, forKey: .poolId)
+        try container.encodeIfPresent(serverUrl, forKey: .serverUrl)
+        try container.encodeIfPresent(displayName, forKey: .displayName)
+        try container.encode(nonce, forKey: .nonce)
+        try container.encodeIfPresent(tunnelExitEnabled, forKey: .tunnelExitEnabled)
     }
 }
 
@@ -737,6 +814,90 @@ public struct ClaimRejectedData: Codable, Sendable, Equatable {
     }
 }
 
+/// Host-originated configuration update for a pool (e.g. tunnel-exit feature flag toggle).
+///
+/// Only the host may send this frame. The server validates `sessionToken` (auto-injected by
+/// `WebSocketTransport.injectSessionToken`) before applying changes. Fields are independently
+/// optional so future flags can be added without breaking older clients.
+public struct UpdatePoolConfigData: Codable, Sendable, Equatable {
+    /// Desired value for the tunnel-exit feature flag. `nil` leaves the flag unchanged.
+    public let tunnelExitEnabled: Bool?
+
+    /// Session token for host authentication. Injected by ``WebSocketTransport`` on send.
+    public var sessionToken: String?
+
+    public init(tunnelExitEnabled: Bool? = nil, sessionToken: String? = nil) {
+        self.tunnelExitEnabled = tunnelExitEnabled
+        self.sessionToken = sessionToken
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tunnelExitEnabled = "tunnel_exit_enabled"
+        case sessionToken = "session_token"
+    }
+}
+
+/// Notification that the pool host's WebSocket session has come up or gone down.
+///
+/// Broadcast by the relay to every connected guest. The pool itself is *not* destroyed
+/// when the host disconnects (relay v0.5.0 onwards) — chat, calls, games, and the
+/// relay tunnel exit continue to work for everyone who is already in the pool. New
+/// joins are still gated on host approval and will be rejected with
+/// ``JoinRejectedData/reason`` `"host_offline_unavailable"` until the host returns.
+public struct PoolHostStatusData: Codable, Sendable, Equatable {
+    /// `true` when the host's WebSocket is currently connected and authenticated; `false`
+    /// when the host has dropped and the relay is keeping the pool alive without them.
+    public let online: Bool
+
+    /// Unix epoch seconds when the host went offline. Present only when ``online`` is
+    /// `false`; `nil` when the host is online (or for legacy/test frames). Decoded with
+    /// ``decodeIfPresent`` so a future relay can choose to omit the field freely.
+    public let offlineSince: Int64?
+
+    public init(online: Bool, offlineSince: Int64? = nil) {
+        self.online = online
+        self.offlineSince = offlineSince
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case online
+        case offlineSince = "offline_since"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.online = try container.decode(Bool.self, forKey: .online)
+        self.offlineSince = try container.decodeIfPresent(Int64.self, forKey: .offlineSince)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(online, forKey: .online)
+        try container.encodeIfPresent(offlineSince, forKey: .offlineSince)
+    }
+}
+
+/// Notification that the pool configuration changed. Broadcast by the server to every
+/// peer in the pool whenever the host successfully updates a config flag.
+public struct PoolConfigUpdatedData: Codable, Sendable, Equatable {
+    /// New value for the tunnel-exit feature flag.
+    public let tunnelExitEnabled: Bool
+
+    /// Whether this update originated from the host (`true`) or a server-side trigger (`false`).
+    /// The Swift client treats both identically today; the field exists for telemetry and future use.
+    public let updatedByHost: Bool
+
+    public init(tunnelExitEnabled: Bool, updatedByHost: Bool) {
+        self.tunnelExitEnabled = tunnelExitEnabled
+        self.updatedByHost = updatedByHost
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tunnelExitEnabled = "tunnel_exit_enabled"
+        case updatedByHost = "updated_by_host"
+    }
+}
+
 // MARK: - Supporting Types
 
 /// Information about a connected peer, as reported by the server.
@@ -785,12 +946,25 @@ public struct ServerPoolInfo: Codable, Sendable, Equatable {
     /// Current number of connected peers.
     public let currentPeers: Int
 
-    public init(poolId: UUID, name: String, hostPeerId: String, maxPeers: Int, currentPeers: Int) {
+    /// Whether the host has enabled tunnel-exit (VPN-like) routing through their device.
+    /// Defaults to `false` if absent from decoded JSON to preserve compatibility with
+    /// legacy mocks and snapshot fixtures that pre-date the feature.
+    public let tunnelExitEnabled: Bool
+
+    /// Whether the pool host's WebSocket is currently online. Defaults to `true` when the
+    /// field is absent so legacy relays (which destroy the pool on host drop instead of
+    /// keeping it alive) continue to work — if we're talking to such a relay and we got a
+    /// `JoinAccepted` back, the host must be online.
+    public let hostOnline: Bool
+
+    public init(poolId: UUID, name: String, hostPeerId: String, maxPeers: Int, currentPeers: Int, tunnelExitEnabled: Bool = false, hostOnline: Bool = true) {
         self.poolId = poolId
         self.name = name
         self.hostPeerId = hostPeerId
         self.maxPeers = maxPeers
         self.currentPeers = currentPeers
+        self.tunnelExitEnabled = tunnelExitEnabled
+        self.hostOnline = hostOnline
     }
 
     enum CodingKeys: String, CodingKey {
@@ -799,6 +973,32 @@ public struct ServerPoolInfo: Codable, Sendable, Equatable {
         case hostPeerId = "host_peer_id"
         case maxPeers = "max_peers"
         case currentPeers = "current_peers"
+        case tunnelExitEnabled = "tunnel_exit_enabled"
+        case hostOnline = "host_online"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.poolId = try container.decode(UUID.self, forKey: .poolId)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.hostPeerId = try container.decode(String.self, forKey: .hostPeerId)
+        self.maxPeers = try container.decode(Int.self, forKey: .maxPeers)
+        self.currentPeers = try container.decode(Int.self, forKey: .currentPeers)
+        self.tunnelExitEnabled = try container.decodeIfPresent(Bool.self, forKey: .tunnelExitEnabled) ?? false
+        // Default to true so legacy relays (which had no concept of host-offline)
+        // keep working — if the relay accepted us, the host must have been online.
+        self.hostOnline = try container.decodeIfPresent(Bool.self, forKey: .hostOnline) ?? true
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(poolId, forKey: .poolId)
+        try container.encode(name, forKey: .name)
+        try container.encode(hostPeerId, forKey: .hostPeerId)
+        try container.encode(maxPeers, forKey: .maxPeers)
+        try container.encode(currentPeers, forKey: .currentPeers)
+        try container.encode(tunnelExitEnabled, forKey: .tunnelExitEnabled)
+        try container.encode(hostOnline, forKey: .hostOnline)
     }
 }
 
@@ -868,6 +1068,15 @@ extension ServerFrame: Codable {
         case heartbeatPong = "heartbeat_pong"
         case claimSuccess = "claim_success"
         case claimRejected = "claim_rejected"
+        case updatePoolConfig = "update_pool_config"
+        case poolConfigUpdated = "pool_config_updated"
+        case poolHostStatus = "pool_host_status"
+        case tunnelOpen = "tunnel_open"
+        case tunnelClose = "tunnel_close"
+        case tunnelWindowUpdate = "tunnel_window_update"
+        case tunnelDnsQuery = "tunnel_dns_query"
+        case tunnelDnsResponse = "tunnel_dns_response"
+        case tunnelError = "tunnel_error"
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -936,6 +1145,24 @@ extension ServerFrame: Codable {
             self = .claimSuccess(try container.decode(ClaimSuccessData.self, forKey: .data))
         case .claimRejected:
             self = .claimRejected(try container.decode(ClaimRejectedData.self, forKey: .data))
+        case .updatePoolConfig:
+            self = .updatePoolConfig(try container.decode(UpdatePoolConfigData.self, forKey: .data))
+        case .poolConfigUpdated:
+            self = .poolConfigUpdated(try container.decode(PoolConfigUpdatedData.self, forKey: .data))
+        case .poolHostStatus:
+            self = .poolHostStatus(try container.decode(PoolHostStatusData.self, forKey: .data))
+        case .tunnelOpen:
+            self = .tunnelOpen(try container.decode(TunnelOpenData.self, forKey: .data))
+        case .tunnelClose:
+            self = .tunnelClose(try container.decode(TunnelCloseData.self, forKey: .data))
+        case .tunnelWindowUpdate:
+            self = .tunnelWindowUpdate(try container.decode(TunnelWindowUpdateData.self, forKey: .data))
+        case .tunnelDnsQuery:
+            self = .tunnelDnsQuery(try container.decode(TunnelDnsQueryData.self, forKey: .data))
+        case .tunnelDnsResponse:
+            self = .tunnelDnsResponse(try container.decode(TunnelDnsResponseData.self, forKey: .data))
+        case .tunnelError:
+            self = .tunnelError(try container.decode(TunnelErrorData.self, forKey: .data))
         }
     }
 
@@ -1028,6 +1255,33 @@ extension ServerFrame: Codable {
             try container.encode(data, forKey: .data)
         case .claimRejected(let data):
             try container.encode(FrameType.claimRejected, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .updatePoolConfig(let data):
+            try container.encode(FrameType.updatePoolConfig, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .poolConfigUpdated(let data):
+            try container.encode(FrameType.poolConfigUpdated, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .poolHostStatus(let data):
+            try container.encode(FrameType.poolHostStatus, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .tunnelOpen(let data):
+            try container.encode(FrameType.tunnelOpen, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .tunnelClose(let data):
+            try container.encode(FrameType.tunnelClose, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .tunnelWindowUpdate(let data):
+            try container.encode(FrameType.tunnelWindowUpdate, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .tunnelDnsQuery(let data):
+            try container.encode(FrameType.tunnelDnsQuery, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .tunnelDnsResponse(let data):
+            try container.encode(FrameType.tunnelDnsResponse, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .tunnelError(let data):
+            try container.encode(FrameType.tunnelError, forKey: .frameType)
             try container.encode(data, forKey: .data)
         }
     }

@@ -49,6 +49,38 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     @Published public private(set) var currentSession: PoolSession?
     @Published public private(set) var isHost: Bool = false
 
+    /// Whether the current pool's host has enabled tunnel-exit ("VPN-like") routing.
+    ///
+    /// Updated from:
+    /// - `JoinAccepted.poolInfo.tunnelExitEnabled` when joining
+    /// - `PeerJoined`-with-pool-info events (future, not yet emitted)
+    /// - `PoolConfigUpdated` server frames at runtime
+    /// - The host's own `setTunnelExitEnabled(_:)` call (immediate optimistic write)
+    ///
+    /// Members consult this before offering the user the "tunnel my traffic through host"
+    /// option in `ProxyManager.startRelayMode(...)`.
+    @Published public private(set) var hostTunnelExitEnabled: Bool = false
+
+    /// Whether the current pool's host has an active WebSocket session with the relay.
+    ///
+    /// Defaults to `true` — both because legacy relays never report otherwise (see
+    /// ``ServerPoolInfo/hostOnline``) and because a fresh session has not yet observed
+    /// any liveness signal. Updated from:
+    /// - `JoinAccepted.poolInfo.hostOnline` when joining
+    /// - inbound `pool_host_status` frames at runtime (relay v0.5.0+)
+    /// - the host's own `host_auth_success` (the host knows they are themselves online)
+    /// - `disconnect()` resets to `true` so the next session starts from a clean slate
+    ///
+    /// Existing chat / call / game / tunnel data paths intentionally ignore this flag —
+    /// they continue to work uninterrupted while the host's WebSocket is down. Only the
+    /// invitation-creation flow and the host-offline UI pill consult it.
+    @Published public private(set) var hostOnline: Bool = true
+
+    /// Timestamp the host went offline at, when known. `nil` whenever ``hostOnline`` is
+    /// `true` or when the relay omitted `offline_since`. Surfaced to the UI for the
+    /// "Host offline · 12 min ago" relative-time pill.
+    @Published public private(set) var hostOfflineSince: Date?
+
     /// Local user's profile
     @Published public var localProfile: PoolUserProfile = .defaultProfile
 
@@ -100,6 +132,67 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         self.poolState = poolState
         self.currentSession = session
         self.isHost = isHost
+    }
+
+    // MARK: - Tunnel Exit Configuration
+
+    /// Errors raised by `setTunnelExitEnabled(_:)`.
+    public enum TunnelConfigError: Error, LocalizedError {
+        case notHost
+        case noRemoteTransport
+
+        public var errorDescription: String? {
+            switch self {
+            case .notHost: return "Only the pool host can change tunnel-exit configuration."
+            case .noRemoteTransport: return "Tunnel-exit configuration requires a remote (relay) pool."
+            }
+        }
+    }
+
+    /// Update the published `hostTunnelExitEnabled` flag from a `PoolInfo` snapshot
+    /// (called when joining or when a peer-joined frame embeds pool info).
+    ///
+    /// - Parameter enabled: Latest server-reported tunnel-exit flag.
+    public func updateHostTunnelExitEnabled(_ enabled: Bool) {
+        guard hostTunnelExitEnabled != enabled else { return }
+        hostTunnelExitEnabled = enabled
+        log("hostTunnelExitEnabled updated to \(enabled)", category: .network)
+    }
+
+    /// Update host liveness state from a `PoolInfo` snapshot or a `pool_host_status` frame.
+    ///
+    /// Idempotent: a flip from `true` -> `true` (or vice versa with a matching timestamp)
+    /// is a no-op so SwiftUI doesn't republish on every keepalive. When transitioning to
+    /// online, ``hostOfflineSince`` is cleared.
+    ///
+    /// - Parameters:
+    ///   - online: Latest relay-reported host liveness flag.
+    ///   - offlineSince: Unix epoch seconds the host went offline at; ignored when `online == true`.
+    public func updateHostOnline(_ online: Bool, offlineSince: Int64? = nil) {
+        let newSince: Date? = online ? nil : offlineSince.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        guard hostOnline != online || hostOfflineSince != newSince else { return }
+        hostOnline = online
+        hostOfflineSince = newSince
+        log("hostOnline updated to \(online) (offlineSince=\(newSince.map(String.init(describing:)) ?? "nil"))", category: .network)
+    }
+
+    /// Host-only: change the tunnel-exit feature flag for this pool.
+    ///
+    /// Sends an `update_pool_config` frame to the relay, optimistically updates the local
+    /// `hostTunnelExitEnabled` cache, and lets the server broadcast `pool_config_updated`
+    /// to peers. Local-only (MultipeerConnectivity) pools have no relay state to update,
+    /// so this method requires `remoteTransport` to be active.
+    ///
+    /// - Parameter value: Desired flag value.
+    /// - Throws: ``TunnelConfigError/notHost`` if the local user is not the host;
+    ///   ``TunnelConfigError/noRemoteTransport`` if no relay-transport bridge is active.
+    public func setTunnelExitEnabled(_ value: Bool) async throws {
+        guard isHost else { throw TunnelConfigError.notHost }
+        guard let transport = remoteTransport else { throw TunnelConfigError.noRemoteTransport }
+        transport.sendUpdatePoolConfig(tunnelExitEnabled: value)
+        // Optimistic local update; the server will echo `pool_config_updated` confirming the
+        // value, at which point updateHostTunnelExitEnabled is called again as a no-op.
+        updateHostTunnelExitEnabled(value)
     }
 
     // MARK: - Private Properties
@@ -1013,6 +1106,10 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         discoveredPeers = []
         currentSession = nil
         isHost = false
+        hostTunnelExitEnabled = false
+        // Reset host liveness to the optimistic default so the next session starts clean.
+        hostOnline = true
+        hostOfflineSince = nil
         peerIDMap = [:]
         discoveredMCPeers = [:]
         peerConnectionTimes = [:]
