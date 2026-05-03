@@ -153,6 +153,21 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// Parsed invitation for joining a pool.
     private var joinInvitation: ParsedInvitation?
 
+    /// Persistent member identity scoped to the active `(serverURL, poolID)`.
+    /// Set whenever a join or rejoin is initiated and reused for the lifetime
+    /// of the WebSocket task so the public key advertised in `JoinRequest` /
+    /// `MemberRejoin` is stable across reconnect attempts.
+    private var memberIdentity: RemoteMemberIdentity?
+
+    /// Display name persisted alongside the member record. Captured once at
+    /// connect time so a `Leave Pool` purge never has to re-derive it.
+    private var memberDisplayName: String?
+
+    /// `true` once we've successfully completed a `member_rejoin` (or fresh
+    /// join) for the active session — used to decide whether subsequent
+    /// reconnect attempts should try `member_rejoin` first.
+    private var memberHasJoinedThisSession: Bool = false
+
     /// Tracks whether a PoW retry is in progress to prevent infinite loops.
     private var powRetryInProgress = false
 
@@ -388,16 +403,79 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// This is the primary entry point for joining a remote pool. The invitation contains
     /// the server URL, pool ID, token secret, and host fingerprint needed for authentication.
     ///
+    /// If a persistent ``RemoteMemberIdentity`` already exists for this
+    /// `(serverURL, poolID)` (i.e. the user has joined this pool before on
+    /// this device), the transport prefers the host-free `member_rejoin`
+    /// path over the host-approval flow encoded in the invitation. New
+    /// invitations are still single-use; the rejoin path uses the persistent
+    /// Ed25519 identity that the relay already records in `approved_peers`.
+    ///
     /// - Parameter invitation: The parsed invitation from a URL or QR code.
     public func requestJoinWithInvitation(_ invitation: ParsedInvitation) {
         isHostRole = false
         intentionalDisconnect = false
         joinInvitation = invitation
         poolID = invitation.poolId
+        memberDisplayName = localPeerName
+        memberHasJoinedThisSession = false
+
+        // Eagerly load the persistent identity (if any) so reconnect attempts
+        // and the join flow itself agree on which public key to present.
+        let serverKey = configuration.serverURL.absoluteString
+        let poolKey = invitation.poolId.uuidString
+        memberIdentity = (try? RemoteMemberIdentity.existing(serverURL: serverKey, poolID: poolKey))
 
         connect { [weak self] in
             guard let self else { return }
-            self.sendJoinRequest(invitation: invitation)
+            if self.memberIdentity != nil {
+                // Saved identity → relay's `approved_peers` already knows us.
+                // Skip the invitation flow and go straight to rejoin.
+                self.sendMemberRejoin()
+            } else {
+                self.sendJoinRequest(invitation: invitation)
+            }
+        }
+    }
+
+    /// Re-authenticate against a pool the user has previously joined, using
+    /// the persistent ``RemoteMemberIdentity`` saved in the Keychain. No
+    /// invitation is required; this only succeeds if the relay still has the
+    /// member's public key in `approved_peers`.
+    ///
+    /// - Parameters:
+    ///   - poolID: The pool to rejoin.
+    ///   - displayName: The display name to advertise. Defaults to
+    ///     ``localPeerName`` so callers can simply pass-through the value
+    ///     captured at construction.
+    public func requestRejoin(poolID: UUID, displayName: String? = nil) {
+        isHostRole = false
+        intentionalDisconnect = false
+        joinInvitation = nil
+        self.poolID = poolID
+        memberDisplayName = displayName ?? localPeerName
+        memberHasJoinedThisSession = false
+
+        let serverKey = configuration.serverURL.absoluteString
+        let poolKey = poolID.uuidString
+        do {
+            guard let existing = try RemoteMemberIdentity.existing(serverURL: serverKey, poolID: poolKey) else {
+                // No saved identity — nothing to rejoin against.
+                logMessage("requestRejoin: no member identity persisted for pool \(poolKey)")
+                updateState(.failed(.invalidToken))
+                delegate?.transport(self, didFailWithError: .invalidToken)
+                return
+            }
+            memberIdentity = existing
+        } catch {
+            logMessage("requestRejoin: failed to load member identity: \(error.localizedDescription)")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
+
+        connect { [weak self] in
+            guard let self else { return }
+            self.sendMemberRejoin()
         }
     }
 
@@ -595,6 +673,12 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                             hostName: self.localPeerName,
                             maxPeers: self.configuration.maxPeers
                         ))
+                    } else if self.memberIdentity != nil {
+                        // We hold a persistent member identity for this pool — skip
+                        // the invitation flow and rejoin directly through the relay's
+                        // `approved_peers` lookup. Works whether the host is online
+                        // or offline, no re-approval prompt for the user.
+                        self.sendMemberRejoin()
                     } else if let invitation = self.joinInvitation {
                         // SECURITY: Check invitation expiry before reconnecting.
                         // Reusing an expired invitation causes the server to reject
@@ -796,15 +880,26 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         let hmac = HMAC<SHA256>.authenticationCode(for: message, using: hmacKey)
         let proof = Data(hmac)
 
-        // Generate a client keypair for this session
-        let clientKey = Curve25519.Signing.PrivateKey()
+        // SECURITY: Use the persistent member identity for this `(serverURL, poolID)`
+        // so the public key the host approves is the same key the relay's
+        // `approved_peers` records — letting the user reconnect indefinitely via
+        // `member_rejoin` without re-prompting the host.
+        let identity: RemoteMemberIdentity
+        do {
+            identity = try persistentMemberIdentity(for: invitation.poolId)
+        } catch {
+            logMessage("[SECURITY] Failed to load member identity for join: \(error.localizedDescription)")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
 
         let frame = ServerFrame.joinRequest(JoinRequestData(
             tokenId: invitation.tokenId.base64EncodedString(),
             proof: proof.base64EncodedString(),
             timestamp: timestamp,
             nonce: nonce.base64EncodedString(),
-            clientPublicKey: clientKey.publicKey.rawRepresentation.base64EncodedString(),
+            clientPublicKey: identity.publicKeyBase64,
             displayName: localPeerName
         ))
         sendFrame(frame)
@@ -839,18 +934,142 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         let hmac = HMAC<SHA256>.authenticationCode(for: message, using: hmacKey)
         let proof = Data(hmac)
 
-        let clientKey = Curve25519.Signing.PrivateKey()
+        // Same persistent identity as the pre-PoW path — see `sendJoinRequest`.
+        let identity: RemoteMemberIdentity
+        do {
+            identity = try persistentMemberIdentity(for: invitation.poolId)
+        } catch {
+            logMessage("[SECURITY] Failed to load member identity for PoW join: \(error.localizedDescription)")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
 
         let frame = ServerFrame.joinRequest(JoinRequestData(
             tokenId: invitation.tokenId.base64EncodedString(),
             proof: proof.base64EncodedString(),
             timestamp: timestamp,
             nonce: nonce.base64EncodedString(),
-            clientPublicKey: clientKey.publicKey.rawRepresentation.base64EncodedString(),
+            clientPublicKey: identity.publicKeyBase64,
             displayName: localPeerName,
             powSolution: powSolution
         ))
         sendFrame(frame)
+    }
+
+    // MARK: - Member Rejoin
+
+    /// Build the signature transcript for the `member_rejoin` frame.
+    ///
+    /// The byte layout is fixed by the wire contract and MUST match the Rust
+    /// relay's verification function exactly:
+    /// ```
+    /// b"STEALTH_MEMBER_REJOIN_V1:" || pool_id_bytes(16) || timestamp_be(8) || nonce_raw(32)
+    /// ```
+    /// The domain separator is intentionally distinct from the host-auth
+    /// `STEALTH_HOST_AUTH_V1:` separator to prevent cross-protocol replay.
+    ///
+    /// Internal so the wire-contract tests can verify the byte layout without
+    /// having to reach through the WebSocket-sending code path.
+    nonisolated static func memberRejoinTranscript(poolID: UUID, timestamp: Int64, nonce: Data) -> Data {
+        var bytes = Data("STEALTH_MEMBER_REJOIN_V1:".utf8)
+        bytes.append(contentsOf: withUnsafeBytes(of: poolID.uuid) { Data($0) })
+        bytes.append(contentsOf: withUnsafeBytes(of: timestamp.bigEndian) { Data($0) })
+        bytes.append(nonce)
+        return bytes
+    }
+
+    /// Send a `member_rejoin` frame using the active ``memberIdentity``.
+    ///
+    /// Caller invariants: ``memberIdentity`` and ``poolID`` must be set, and a
+    /// `connect()` must already be in progress (we send before the relay's
+    /// auth challenge because the relay validates `member_rejoin` against the
+    /// in-band `pool_id` + signature, not a server-issued nonce).
+    private func sendMemberRejoin() {
+        guard let identity = memberIdentity, let poolID else {
+            logMessage("sendMemberRejoin: missing member identity or pool ID")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
+
+        updateState(.connecting)
+
+        let timestamp = Int64(Date().timeIntervalSince1970)
+        var nonce = Data(count: 32)
+        let rc = nonce.withUnsafeMutableBytes { buf -> Int32 in
+            guard let base = buf.baseAddress else { return errSecParam }
+            return SecRandomCopyBytes(kSecRandomDefault, 32, base)
+        }
+        guard rc == errSecSuccess else {
+            logMessage("[SECURITY] SecRandomCopyBytes failed for member_rejoin nonce: \(rc)")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
+
+        let transcript = Self.memberRejoinTranscript(poolID: poolID, timestamp: timestamp, nonce: nonce)
+
+        let signature: Data
+        do {
+            signature = try identity.sign(transcript: transcript)
+        } catch {
+            logMessage("[SECURITY] member_rejoin signing failed: \(error.localizedDescription)")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
+
+        let frame = ServerFrame.memberRejoin(MemberRejoinData(
+            poolId: poolID.uuidString,
+            clientPublicKey: identity.publicKeyBase64,
+            timestamp: timestamp,
+            nonce: nonce.base64EncodedString(),
+            signature: signature.base64EncodedString(),
+            displayName: memberDisplayName ?? localPeerName
+        ))
+        sendFrame(frame)
+    }
+
+    /// Load (or create on first call) the persistent member identity for the
+    /// supplied pool, caching it on `self` so subsequent join / rejoin /
+    /// reconnect cycles within this session don't re-hit the Keychain.
+    private func persistentMemberIdentity(for poolID: UUID) throws -> RemoteMemberIdentity {
+        if let cached = memberIdentity { return cached }
+        let serverKey = configuration.serverURL.absoluteString
+        let identity = try RemoteMemberIdentity.loadOrCreate(
+            serverURL: serverKey,
+            poolID: poolID.uuidString
+        )
+        memberIdentity = identity
+        return identity
+    }
+
+    /// Drop the Keychain identity AND the saved record for the active member
+    /// session. Used on `403 not_approved` and `404 pool_not_found`, and from
+    /// the public ``leaveMemberPool()`` API when the user explicitly walks
+    /// away from a pool.
+    private func purgeMemberStateForCurrentPool() {
+        guard let poolID else { return }
+        let serverKey = configuration.serverURL.absoluteString
+        let poolKey = poolID.uuidString
+        do {
+            try RemoteMemberIdentity.delete(serverURL: serverKey, poolID: poolKey)
+        } catch {
+            logMessage("purgeMemberStateForCurrentPool: identity delete failed: \(error.localizedDescription)")
+        }
+        RemoteMemberRecordStore.remove(serverURL: serverKey, poolID: poolKey)
+        memberIdentity = nil
+        memberHasJoinedThisSession = false
+    }
+
+    /// Explicit "Leave Pool" from the UI: tear down the WebSocket, drop the
+    /// persisted identity and record, and ensure the auto-rejoin loop doesn't
+    /// fire on next launch. Distinct from ``disconnect()`` (transport-level
+    /// teardown) so transient drops don't lose state.
+    public func leaveMemberPool() {
+        purgeMemberStateForCurrentPool()
+        disconnect()
     }
 
     // MARK: - Proof-of-Work Solver
@@ -1012,8 +1231,38 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             localPeerID = data.peerId
             currentPoolInfo = data.poolInfo
             reconnectAttempt = 0
+            memberHasJoinedThisSession = true
             updateState(.connected)
             startHeartbeat()
+
+            // Persist (or refresh) the member record so the home UI can show a
+            // "Rejoin" tile and the next connect attempt can skip the
+            // invitation flow entirely. Only do this on the member side — host
+            // sessions are tracked through `RemotePoolState` instead.
+            if !isHostRole, let identity = memberIdentity {
+                let serverKey = configuration.serverURL.absoluteString
+                let poolKey = data.poolInfo.poolId.uuidString
+                let now = Date()
+                if let existing = RemoteMemberRecordStore.record(serverURL: serverKey, poolID: poolKey) {
+                    RemoteMemberRecordStore.upsert(RemoteMemberRecord(
+                        serverURL: existing.serverURL,
+                        poolID: existing.poolID,
+                        memberPublicKeyBase64: identity.publicKeyBase64,
+                        displayName: memberDisplayName ?? existing.displayName,
+                        firstJoinedAt: existing.firstJoinedAt,
+                        lastSuccessfulConnectAt: now
+                    ))
+                } else {
+                    RemoteMemberRecordStore.upsert(RemoteMemberRecord(
+                        serverURL: serverKey,
+                        poolID: poolKey,
+                        memberPublicKeyBase64: identity.publicKeyBase64,
+                        displayName: memberDisplayName ?? localPeerName,
+                        firstJoinedAt: now,
+                        lastSuccessfulConnectAt: now
+                    ))
+                }
+            }
 
             // Surface the host's tunnel-exit flag immediately so member UIs
             // can decide whether to offer the relay-tunnel toggle.
@@ -1151,6 +1400,21 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             if lowerMessage.contains("not yet claimed") || lowerMessage.contains("unclaimed") || lowerMessage.contains("not claimed") {
                 serverIsUnclaimed = true
                 transportError = .serverUnclaimed
+            } else if data.code == 403 && lowerMessage.contains("not_approved") {
+                // Relay reports our member public key is no longer in the pool's
+                // `approved_peers` set — host kicked us, or the host reset the pool,
+                // or this device's identity was never approved. Drop the persisted
+                // identity + record so the next attempt falls back to the fresh-join
+                // path (which requires a new invitation), and stop reconnect retries.
+                intentionalDisconnect = true
+                purgeMemberStateForCurrentPool()
+                transportError = .notApproved
+            } else if data.code == 404 && lowerMessage.contains("pool_not_found") {
+                // Relay says the pool itself is gone (host closed, TTL elapsed).
+                // Drop saved state and stop reconnect retries.
+                intentionalDisconnect = true
+                purgeMemberStateForCurrentPool()
+                transportError = .poolNotFound
             } else if data.code == 403 && lowerMessage.contains("pubkey mismatch") {
                 // Host tried to rebind to an existing pool with a different identity (e.g.
                 // app reinstalled, keychain wiped). Suppress reconnect so we don't loop on
@@ -1169,6 +1433,11 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                 case 408: transportError = .timeout
                 case 410: transportError = .sessionExpired
                 case 426: transportError = .protocolMismatch
+                case 503:
+                    // Transient: e.g. "pool_full". Surface as connectionFailed and let
+                    // the existing reconnect/backoff loop retry. We deliberately do NOT
+                    // touch saved member state on transient errors.
+                    transportError = .connectionFailed
                 default: transportError = .from(NSError(domain: "ServerFrame", code: Int(data.code),
                                                          userInfo: [NSLocalizedDescriptionKey: data.message]))
                 }
@@ -1243,7 +1512,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             // These are client-to-server tunnel frames; should not be received from the relay.
             logMessage("Unexpected client->server tunnel frame received from server")
 
-        case .hostAuth, .joinRequest, .forward, .kickPeer,
+        case .hostAuth, .joinRequest, .memberRejoin, .forward, .kickPeer,
              .createInvitation, .revokeInvitation, .joinApproval,
              .ack, .closePool, .handshakeInit, .heartbeatPing,
              .claimServer, .updatePoolConfig:

@@ -25,6 +25,12 @@ public enum ServerFrame: Sendable, Equatable {
     /// Request to join a pool using an invitation token.
     case joinRequest(JoinRequestData)
 
+    /// Re-authenticate as a previously-approved member of a pool. The relay
+    /// uses the persistent member public key to look up `approved_peers`; if
+    /// present, the connection is accepted without host involvement (relay
+    /// v0.5.0+). See ``MemberRejoinData`` for the wire shape.
+    case memberRejoin(MemberRejoinData)
+
     /// Forward opaque E2E-encrypted application data to peer(s).
     case forward(ForwardData)
 
@@ -276,6 +282,83 @@ public struct JoinRequestData: Codable, Sendable, Equatable {
         case clientPublicKey = "client_public_key"
         case displayName = "display_name"
         case powSolution = "pow_solution"
+    }
+}
+
+/// Re-authentication payload sent by a previously-approved member to rejoin a
+/// pool without host involvement.
+///
+/// Wire contract (must match the StealthRelay v0.5.0+ Rust agent exactly):
+///
+/// ```json
+/// {
+///   "frame_type": "member_rejoin",
+///   "data": {
+///     "pool_id": "<UUID string>",
+///     "client_public_key": "<base64 Ed25519 pubkey, 32 raw bytes>",
+///     "timestamp": 1714752345,
+///     "nonce": "<base64 32 raw bytes>",
+///     "signature": "<base64 Ed25519 signature>",
+///     "display_name": "<string ≤64 chars>"
+///   }
+/// }
+/// ```
+///
+/// Signature transcript (in this exact order):
+/// ```
+/// b"STEALTH_MEMBER_REJOIN_V1:" || pool_id_bytes(16) || timestamp_be(8) || nonce_raw(32)
+/// ```
+///
+/// `pool_id_bytes` is the 16-byte raw UUID representation (NOT the string
+/// form), `timestamp_be` is the i64 timestamp big-endian, and `nonce_raw` is
+/// the 32 raw bytes (NOT base64). The domain separator is intentionally
+/// distinct from `STEALTH_HOST_AUTH_V1:` to prevent cross-protocol replay.
+public struct MemberRejoinData: Codable, Sendable, Equatable {
+    /// The pool the member is rejoining, encoded as a UUID string.
+    public let poolId: String
+
+    /// Base64-encoded Ed25519 public key of the rejoining member. Must match
+    /// the key the relay recorded in `approved_peers` when the host approved
+    /// this peer's original join.
+    public let clientPublicKey: String
+
+    /// Unix timestamp (seconds) when the rejoin transcript was signed.
+    public let timestamp: Int64
+
+    /// Base64-encoded 32-byte random nonce included in the signature
+    /// transcript for replay protection.
+    public let nonce: String
+
+    /// Base64-encoded Ed25519 signature over the transcript described above.
+    public let signature: String
+
+    /// Display name to surface to other peers in the pool. Bounded to 64
+    /// characters by the relay-side validator.
+    public let displayName: String
+
+    public init(
+        poolId: String,
+        clientPublicKey: String,
+        timestamp: Int64,
+        nonce: String,
+        signature: String,
+        displayName: String
+    ) {
+        self.poolId = poolId
+        self.clientPublicKey = clientPublicKey
+        self.timestamp = timestamp
+        self.nonce = nonce
+        self.signature = signature
+        self.displayName = displayName
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case poolId = "pool_id"
+        case clientPublicKey = "client_public_key"
+        case timestamp
+        case nonce
+        case signature
+        case displayName = "display_name"
     }
 }
 
@@ -1042,6 +1125,7 @@ extension ServerFrame: Codable {
     private enum FrameType: String, Codable {
         case hostAuth = "host_auth"
         case joinRequest = "join_request"
+        case memberRejoin = "member_rejoin"
         case forward
         case kickPeer = "kick_peer"
         case createInvitation = "create_invitation"
@@ -1093,6 +1177,8 @@ extension ServerFrame: Codable {
             self = .hostAuth(try container.decode(HostAuthData.self, forKey: .data))
         case .joinRequest:
             self = .joinRequest(try container.decode(JoinRequestData.self, forKey: .data))
+        case .memberRejoin:
+            self = .memberRejoin(try container.decode(MemberRejoinData.self, forKey: .data))
         case .forward:
             self = .forward(try container.decode(ForwardData.self, forKey: .data))
         case .kickPeer:
@@ -1175,6 +1261,9 @@ extension ServerFrame: Codable {
             try container.encode(data, forKey: .data)
         case .joinRequest(let data):
             try container.encode(FrameType.joinRequest, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .memberRejoin(let data):
+            try container.encode(FrameType.memberRejoin, forKey: .frameType)
             try container.encode(data, forKey: .data)
         case .forward(let data):
             try container.encode(FrameType.forward, forKey: .frameType)

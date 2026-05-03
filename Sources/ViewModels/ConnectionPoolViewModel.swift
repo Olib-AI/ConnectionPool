@@ -983,6 +983,91 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         serverClaimed = false
     }
 
+    /// Saved remote pools the user is a member of, sorted by most-recent
+    /// successful connection. Surfaced in the home view as "Rejoin" tiles.
+    /// Mirrors the on-disk store; refresh via ``refreshSavedRemoteMemberPools()``.
+    @Published public private(set) var savedRemoteMemberPools: [RemoteMemberRecord] = RemoteMemberRecordStore.allRecords()
+
+    /// Re-read the saved-records store from disk and republish. Call after
+    /// any operation that mutates the store (rejoin success, leave pool,
+    /// app foregrounding) so the UI reflects current state.
+    public func refreshSavedRemoteMemberPools() {
+        savedRemoteMemberPools = RemoteMemberRecordStore.allRecords()
+    }
+
+    /// Rejoin a previously-joined remote pool using the persistent
+    /// ``RemoteMemberIdentity`` saved in the Keychain. No invitation needed
+    /// — the relay's `approved_peers` set lets us back in directly.
+    ///
+    /// - Parameter record: The saved record describing which pool to rejoin.
+    public func rejoinRemotePool(_ record: RemoteMemberRecord) {
+        guard let url = URL(string: record.serverURL) else {
+            showError(message: "Invalid saved server URL.")
+            return
+        }
+        guard let poolUUID = UUID(uuidString: record.poolID) else {
+            showError(message: "Saved pool ID is malformed.")
+            return
+        }
+
+        let config = RemotePoolConfiguration(
+            serverURL: url,
+            poolName: "Remote Pool",
+            maxPeers: 8
+        )
+
+        transportMode = .remote
+        serverURL = record.serverURL
+        isConnectingRemote = true
+
+        let transport = WebSocketTransport(
+            configuration: config,
+            displayName: poolManager.localProfile.displayName
+        )
+        transport.delegate = self
+        webSocketTransport = transport
+        remotePoolID = poolUUID
+
+        transport.requestRejoin(poolID: poolUUID, displayName: poolManager.localProfile.displayName)
+        log("Rejoining remote pool \(record.poolID.prefix(8))... via persisted identity", category: .network)
+    }
+
+    /// Forget a saved remote member pool from the home-screen list without
+    /// disconnecting from any other active session. Drops both the Keychain
+    /// identity and the `RemoteMemberRecord`. After forgetting the user must
+    /// obtain a fresh invitation to join again.
+    public func forgetRemoteMemberPool(_ record: RemoteMemberRecord) {
+        do {
+            try RemoteMemberIdentity.delete(serverURL: record.serverURL, poolID: record.poolID)
+        } catch {
+            log("forgetRemoteMemberPool: identity delete failed: \(error.localizedDescription)", category: .runtime)
+        }
+        RemoteMemberRecordStore.remove(serverURL: record.serverURL, poolID: record.poolID)
+        refreshSavedRemoteMemberPools()
+    }
+
+    /// Explicit "Leave Pool" surface for remote members. Distinct from
+    /// `disconnect()` — this also drops the persistent member identity and
+    /// the `RemoteMemberRecord` so the pool no longer appears as a "Rejoin"
+    /// tile and so the next attempt would require a fresh invitation.
+    public func leaveRemoteMemberPool() {
+        guard transportMode == .remote, !isHost else {
+            // Hosts use the existing close-pool flow; locals don't have the concept.
+            disconnect()
+            return
+        }
+        if let transport = webSocketTransport {
+            transport.leaveMemberPool()
+        }
+        webSocketTransport = nil
+        // Run the same in-memory cleanup the regular disconnect does.
+        disconnect()
+        // The transport already removed the record from the store; mirror it here
+        // so any view observing `savedRemoteMemberPools` updates immediately.
+        refreshSavedRemoteMemberPools()
+        log("Left remote member pool — identity and record purged", category: .runtime)
+    }
+
     /// Join a remote pool via invitation URL.
     public func joinRemotePool(invitationURL: String) {
         let trimmed = invitationURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1022,6 +1107,7 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         )
         transport.delegate = self
         webSocketTransport = transport
+        remotePoolID = invitation.poolId
 
         transport.requestJoinWithInvitation(invitation)
         log("Joining remote pool via invitation", category: .network)
@@ -1277,6 +1363,10 @@ extension ConnectionPoolViewModel: TransportDelegate {
             isConnectingRemote = false
             poolState = .connected
             currentView = .lobby
+            // Refresh the saved-pools snapshot — `WebSocketTransport.joinAccepted`
+            // upserts the `RemoteMemberRecord` before this state transition fires,
+            // so the home tile list reflects the new / updated entry on next nav.
+            refreshSavedRemoteMemberPools()
             // Bridge for joiner
             if transportMode == .remote, let ws = webSocketTransport {
                 poolManager.remoteTransport = ws
@@ -1489,6 +1579,29 @@ extension ConnectionPoolViewModel: TransportDelegate {
             // can't approve new joins. Surface a friendly message and don't auto-retry —
             // the transport already suppressed reconnection on this path.
             showError(message: "The pool host is currently offline. Try again later.")
+        case .notApproved:
+            // Relay v0.5.0+ `member_rejoin` rejection: this peer is no longer in the
+            // pool's `approved_peers` set. The transport already deleted the persistent
+            // identity + record; we tear down the in-flight connection and surface the
+            // "membership revoked" message. The saved-pools list will refresh
+            // automatically since the record is gone.
+            webSocketTransport = nil
+            isConnectingRemote = false
+            transportMode = .local
+            poolState = .idle
+            currentView = .home
+            refreshSavedRemoteMemberPools()
+            showError(message: "You are no longer a member of this pool.")
+        case .poolNotFound:
+            // Pool was destroyed (host closed it, or TTL elapsed). Same teardown path
+            // as `notApproved` — saved state is already gone.
+            webSocketTransport = nil
+            isConnectingRemote = false
+            transportMode = .local
+            poolState = .idle
+            currentView = .home
+            refreshSavedRemoteMemberPools()
+            showError(message: "This pool no longer exists.")
         default:
             showError(message: error.localizedDescription)
         }

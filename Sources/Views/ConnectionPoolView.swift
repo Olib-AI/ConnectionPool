@@ -351,6 +351,14 @@ private struct HomeView: View {
                     .padding(.horizontal)
                 }
 
+                // Saved member-side pools — auto-rejoin tiles. Each entry maps to a
+                // pool the user has been approved into; tapping skips the invitation
+                // flow entirely and reuses the persisted Ed25519 identity.
+                if !viewModel.savedRemoteMemberPools.isEmpty {
+                    SavedMemberPoolsSection(viewModel: viewModel)
+                        .padding(.horizontal)
+                }
+
                 // Remote Pool Section
                 VStack(spacing: 12) {
                     Text("Remote Pool")
@@ -406,6 +414,9 @@ private struct HomeView: View {
             Text("Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect.")
         }
         .crossPlatformNavigationBarHidden(true)
+        .onAppear {
+            viewModel.refreshSavedRemoteMemberPools()
+        }
         .sheet(isPresented: $showRemoteHostSheet) {
             RemoteHostSheet(viewModel: viewModel)
         }
@@ -748,11 +759,18 @@ private struct PoolLobbyView: View {
                             TunnelExitHostCard(viewModel: viewModel)
                         }
 
-                        // Tunnel-Through-Relay card. Remote pools only — local Multipeer pools
-                        // have no relay. Visible to everyone in the pool (including the host —
-                        // a host can use their own relay as an exit for their own traffic).
-                        // The action button is disabled until `tunnelExitEnabled` is on.
-                        if viewModel.transportMode == .remote {
+                        // Route-Through-Relay card. Remote pools only — local Multipeer pools
+                        // have no relay. Visibility rules:
+                        //   • Host: always visible (host can use their own relay regardless of
+                        //     whether they've allowed members).
+                        //   • Member: visible only when the host has enabled tunnel-exit, OR
+                        //     the member is currently routing (so they can stop). Hiding the
+                        //     card from non-host members when the feature is off keeps the
+                        //     option from being discoverable to peers the host hasn't authorised.
+                        if viewModel.transportMode == .remote
+                            && (viewModel.isHost
+                                || viewModel.hostTunnelExitEnabled
+                                || viewModel.memberRelayActive) {
                             RelayTunnelCard(viewModel: viewModel)
                         }
 
@@ -1153,12 +1171,6 @@ private struct RelayTunnelCard: View {
                 Text("Route your browser traffic through the relay server. Useful when you want a different exit IP than your home network.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                // Per-pool approval is the *member* gate — the host always passes it locally.
-                if !viewModel.isHost && !viewModel.hostTunnelExitEnabled {
-                    Label("The host hasn't enabled relay exit yet. Ask them to turn it on in Pool Settings.", systemImage: "info.circle")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
                 Button {
                     Task { await viewModel.onStartMemberRelayMode?() }
                 } label: {
@@ -1173,10 +1185,7 @@ private struct RelayTunnelCard: View {
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(
-                    (!viewModel.isHost && !viewModel.hostTunnelExitEnabled)
-                        || viewModel.memberRelayPending
-                )
+                .disabled(viewModel.memberRelayPending)
             }
         }
         .padding()
@@ -1409,6 +1418,7 @@ private struct ParticipantsCard: View {
                         isLocalPeer: peer.id == viewModel.poolManager.localPeerID,
                         avatarColors: avatarColors,
                         isHost: viewModel.isHost,
+                        hostOnline: viewModel.hostOnline,
                         onKick: { viewModel.kickPeer(peer) },
                         onBlock: { viewModel.blockPeer(peer) }
                     )
@@ -1428,8 +1438,17 @@ private struct ParticipantRow: View {
     let isLocalPeer: Bool
     let avatarColors: [Color]
     let isHost: Bool
+    /// Authoritative host-presence flag (from `pool_host_status`). The relay
+    /// deliberately does not emit `peer_left` for the host on disconnect, so
+    /// `peer.status` cannot be trusted for the host row — consult this instead.
+    let hostOnline: Bool
     let onKick: () -> Void
     let onBlock: () -> Void
+
+    /// `true` when this row represents the pool host AND the host is currently offline.
+    private var hostShownAsOffline: Bool {
+        peer.isHost && !hostOnline
+    }
 
     private var avatarColor: Color {
         avatarColors[peer.avatarColorIndex % avatarColors.count]
@@ -1481,12 +1500,16 @@ private struct ParticipantRow: View {
                 }
 
                 HStack(spacing: 4) {
-                    Image(systemName: peer.status.iconName)
+                    Image(systemName: hostShownAsOffline ? "wifi.slash" : peer.status.iconName)
                         .font(.caption2)
-                    Text(peer.status.displayText)
+                    Text(hostShownAsOffline ? "Offline" : peer.status.displayText)
                         .font(.caption)
                 }
-                .foregroundStyle(peer.status == .connected ? .green : .secondary)
+                .foregroundStyle(
+                    hostShownAsOffline
+                        ? Color.secondary
+                        : (peer.status == .connected ? Color.green : Color.secondary)
+                )
             }
 
             Spacer()
@@ -1659,25 +1682,59 @@ private struct QuickActionsCard: View {
                 }
             }
 
-            // Disconnect Button
-            Button {
-                viewModel.disconnect()
-            } label: {
-                HStack {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
-                    Text(viewModel.isHost ? "Close Pool" : "Leave Pool")
-                        .font(.headline)
-                    Spacer()
-                }
-                .padding()
-                .background(Color.red.opacity(0.1))
-                .foregroundStyle(.red)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
+            // Disconnect Button.
+            //
+            // For remote *members* this routes through `leaveRemoteMemberPool()`,
+            // which deletes the persistent Keychain identity + saved record so the
+            // pool no longer auto-rejoins on next launch. We confirm via an alert
+            // because the action is destructive (the user must obtain a new
+            // invitation to come back). Hosts and local-mode users get the original
+            // synchronous disconnect.
+            DisconnectControl(viewModel: viewModel)
         }
         .sheet(isPresented: $showGamesSheet) {
             GamesSelectionSheet(viewModel: viewModel)
+        }
+    }
+}
+
+/// Shared "Close Pool" / "Leave Pool" button. Encapsulates the confirm-alert
+/// state so the parent body stays a clean expression tree.
+private struct DisconnectControl: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    @State private var showLeaveConfirmation = false
+
+    private var isRemoteMember: Bool {
+        viewModel.transportMode == .remote && !viewModel.isHost
+    }
+
+    var body: some View {
+        Button {
+            if isRemoteMember {
+                showLeaveConfirmation = true
+            } else {
+                viewModel.disconnect()
+            }
+        } label: {
+            HStack {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title3)
+                Text(viewModel.isHost ? "Close Pool" : "Leave Pool")
+                    .font(.headline)
+                Spacer()
+            }
+            .padding()
+            .background(Color.red.opacity(0.1))
+            .foregroundStyle(.red)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .alert("Leave this pool?", isPresented: $showLeaveConfirmation) {
+            Button("Leave Pool", role: .destructive) {
+                viewModel.leaveRemoteMemberPool()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You'll need a new invitation to join again.")
         }
     }
 }
@@ -2858,6 +2915,104 @@ private struct RemoteJoinSheet: View {
 
     var body: some View {
         ReceiveInvitationView(viewModel: viewModel)
+    }
+}
+
+// MARK: - Saved Member Pools Section
+
+/// Home-screen list of remote pools the user is already a member of. Each row
+/// maps to a saved ``RemoteMemberRecord`` and exposes:
+///   - Tap: invokes ``ConnectionPoolViewModel/rejoinRemotePool(_:)``, skipping
+///     the invitation flow by reusing the persisted Ed25519 identity.
+///   - Trash: invokes ``ConnectionPoolViewModel/forgetRemoteMemberPool(_:)``,
+///     deleting the Keychain identity and the saved record. After forgetting
+///     the user must obtain a new invitation to join again.
+private struct SavedMemberPoolsSection: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    @State private var pendingForget: RemoteMemberRecord?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("Your Pools")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            ForEach(viewModel.savedRemoteMemberPools, id: \.compositeKey) { record in
+                SavedMemberPoolRow(
+                    record: record,
+                    onRejoin: { viewModel.rejoinRemotePool(record) },
+                    onForget: { pendingForget = record }
+                )
+            }
+        }
+        .alert(
+            "Forget this pool?",
+            isPresented: Binding(
+                get: { pendingForget != nil },
+                set: { if !$0 { pendingForget = nil } }
+            ),
+            presenting: pendingForget
+        ) { record in
+            Button("Forget", role: .destructive) {
+                viewModel.forgetRemoteMemberPool(record)
+                pendingForget = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingForget = nil
+            }
+        } message: { _ in
+            Text("You'll need a new invitation to join again.")
+        }
+    }
+}
+
+private struct SavedMemberPoolRow: View {
+    let record: RemoteMemberRecord
+    let onRejoin: () -> Void
+    let onForget: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onRejoin) {
+                HStack(spacing: 12) {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.purple)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(record.displayName.isEmpty ? "Remote Pool" : record.displayName)
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.primary)
+                        Text(record.serverURL)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let last = record.lastSuccessfulConnectAt {
+                            Text("Last connected \(last, style: .relative) ago")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            Button(role: .destructive, action: onForget) {
+                Image(systemName: "trash")
+                    .font(.subheadline)
+                    .foregroundStyle(.red)
+                    .padding(8)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding()
+        .background(Color.purple.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 }
 

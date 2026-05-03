@@ -149,6 +149,17 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
     /// host disconnect), but new joins require an online host to approve them.
     case hostOffline
 
+    /// The relay rejected a `member_rejoin` because this peer is no longer in the
+    /// pool's `approved_peers` set — either the host kicked them or they were
+    /// never approved on this device. The persisted member identity is now stale
+    /// and should be deleted; the user must obtain a fresh invitation to rejoin.
+    case notApproved
+
+    /// The relay reported the pool no longer exists (host closed it, or the pool
+    /// TTL elapsed after a sustained host outage). The persisted member identity
+    /// and saved record are stale and should be deleted.
+    case poolNotFound
+
     /// An underlying system error occurred.
     case underlying(WrappedError)
 
@@ -164,6 +175,8 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
         case .kicked: return "Kicked from pool"
         case .serverUnclaimed: return "Server not yet claimed"
         case .hostOffline: return "The pool host is currently offline. Try again later."
+        case .notApproved: return "Pool no longer available — your membership was revoked."
+        case .poolNotFound: return "This pool no longer exists."
         case .underlying(let wrapped): return "Error: \(wrapped.message)"
         }
     }
@@ -181,7 +194,9 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
              (.protocolMismatch, .protocolMismatch),
              (.kicked, .kicked),
              (.serverUnclaimed, .serverUnclaimed),
-             (.hostOffline, .hostOffline):
+             (.hostOffline, .hostOffline),
+             (.notApproved, .notApproved),
+             (.poolNotFound, .poolNotFound):
             return true
         case (.underlying(let a), .underlying(let b)):
             return a.message == b.message

@@ -57,7 +57,8 @@ Zero external dependencies. Everything ships in one Swift package.
 - **1 MB WebSocket frame limit** — Incoming WebSocket frames exceeding 1 MB are dropped before processing to prevent memory exhaustion from malicious servers
 - **Cloudflare Tunnel support** — Production deployment via `cloudflared` for TLS termination without managing certificates
 - **Pool persistence past host disconnect** — When the pool host's WebSocket drops, the pool stays alive on the relay; existing peers keep messaging, calling, gaming, and tunneling. The host re-authenticates with the same Ed25519 key + `pool_id` to rebind in place. New joins are still gated on the host being online (no auto-approve). Surfaced via `ConnectionPoolManager.hostOnline` and the `pool_host_status` server frame
-- **Host-offline join rejection** — Join requests received while the host is offline are rejected with `JoinRejected.reason == "host_offline_unavailable"` and surfaced as `TransportError.hostOffline` to a friendly user message — auto-reconnect is suppressed on this path so devices don't hammer the relay with rejections
+- **Persistent member identity + rejoin without host** — Each member's Ed25519 keypair is stored in the iOS Keychain (scoped per `serverURL + poolID`) and reused across app launches. Once the host has approved a member one time, that member can reconnect indefinitely via the new `member_rejoin` frame — no host involvement, works whether host online or offline. Saved member records survive cold launches via the pluggable `remotePoolStateStorageProvider`; a `403 not_approved` from the relay (kicked) or `404 pool_not_found` (pool destroyed) drops the saved state cleanly
+- **Host-offline join rejection (new joiners only)** — Join requests received from never-approved peers while the host is offline are rejected with `JoinRejected.reason == "host_offline_unavailable"` and surfaced as `TransportError.hostOffline` to a friendly user message. Returning members aren't affected — they take the `member_rejoin` path
 - **Tunnel-exit (VPN-like) client** — `RelayTunnelClient` opens TCP/UDP streams through the relay so the relay's IP becomes the visible exit address. Used by StealthOS's in-app proxy to route browser traffic; TLS to the destination remains end-to-end (relay sees only ciphertext). Per-pool host approval gate via `update_pool_config { tunnel_exit_enabled }`; the host bypasses their own gate
 - **Binary hot-path frames** — `TUNNEL_DATA` (`0x01`) and `TUNNEL_UDP` (`0x02`) ride binary WebSocket frames with a fixed-size big-endian header (no base64, no JSON parse on the byte path). Control plane (open / close / window_update / dns / error) stays JSON for debuggability
 - **Credit-based flow control** — Per-stream send-credit window (256 KiB initial; relay grants additional credit via `tunnel_window_update` as it consumes bytes). Stops the WebSocket from getting evicted by the relay's slow-consumer threshold under sustained traffic
@@ -220,6 +221,18 @@ The host reclaims the pool by re-running `host_auth` with the same Ed25519 key a
 
 A 60-second eviction sweep destroys pools whose host has been offline longer than `[pool] host_offline_ttl_secs` (default 24h) or that are simultaneously empty + host-offline for `empty_grace_secs` (default 5min). Targeted forwards to an offline host buffer in the existing per-peer queue and replay on rebind.
 
+#### Member Rejoin Without Host
+
+The host's *approval* is a one-time act. The relay tracks an `approved_peers` set (Ed25519 pubkeys) per pool, populated when the host sends `JoinApproval { approved: true }` and pruned on `KickPeer`. Once approved, a member can reconnect indefinitely via the `member_rejoin` frame:
+
+- Client signs `b"STEALTH_MEMBER_REJOIN_V1:" || pool_uuid_bytes || timestamp_be || nonce_raw` with their persistent Ed25519 key
+- Relay verifies the signature, checks the pubkey against `approved_peers`, and issues `JoinAccepted` directly — no host round-trip
+- Works whether the host is online or offline
+- Same-pubkey reconnect from a fresh connection evicts the stale connection with `Kicked { reason: "rejoined_elsewhere" }`
+- A `403 not_approved` or `404 pool_not_found` is a terminal signal — the iOS client purges the saved identity and `RemoteMemberRecord`, surfacing "membership revoked" or "pool no longer exists"
+
+This makes host disconnection *truly* transparent: members can close the app, restart their device, lose Wi-Fi for an hour — and pick up right where they left off.
+
 ### Tunnel Exit (VPN-like)
 
 The relay can act as a network exit for authenticated pool members — opening real TCP/UDP sockets to internet destinations and bridging bytes back over the WebSocket. Three gates apply on every `tunnel_open`:
@@ -256,7 +269,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Olib-AI/ConnectionPool.git", from: "1.5.0")
+    .package(url: "https://github.com/Olib-AI/ConnectionPool.git", from: "1.5.1")
 ]
 ```
 
@@ -470,6 +483,24 @@ await stream.close()
 
 The relay rejects `tunnel_open` with `tunnel_close { reason: "policy_denied" }` when the server-wide flag is off, the per-pool flag is off (members only), the destination is in the relay's CIDR/port deny list, or the connection isn't authenticated to a pool. `policy_denied` posts `RelayTunnelKillSwitchTriggered` so the host app can drive a kill-switch UI.
 
+### Returning Members (Auto-Rejoin)
+
+Once a member has been approved into a pool, they can reopen the app and reconnect without an invitation or the host being online:
+
+```swift
+// Find pools the user has previously joined on this device
+let saved = viewModel.savedRemoteMemberPools
+
+// Tap "Rejoin" on a row
+viewModel.rejoinRemotePool(saved[0])
+
+// Or explicitly leave and forget the pool — drops Keychain identity + record;
+// user will need a fresh invitation to come back
+viewModel.leaveRemoteMemberPool()
+```
+
+If the relay returns `403 not_approved` (host kicked the member) or `404 pool_not_found` (pool destroyed), the identity and saved record are dropped automatically and the user sees a clear message. Network blips during rejoin do NOT drop saved state.
+
 ### Host-Offline Behavior
 
 The pool persists when the host's WebSocket drops. Members keep chatting, calling, gaming, and tunneling. Observe the published state to drive a UI pill:
@@ -584,6 +615,8 @@ When set, `RemotePoolState` persists through this provider instead of plain `Use
 | `RemoteInvitation` | An active invitation with token ID, shareable URL, expiry, and max uses. |
 | `ParsedInvitation` | Decoded invitation URL fields: pool ID, token secret, server address, host fingerprint. |
 | `RemoteHostIdentity` | Ed25519 signing identity for the pool host (Keychain-stored private key). |
+| `RemoteMemberIdentity` | Ed25519 signing identity for a pool member (Keychain-stored private key, scoped per `serverURL + poolID`). Reused across app launches so the relay's `approved_peers` lookup recognizes returning members. |
+| `RemoteMemberRecord` | Persistent ledger entry for a remote pool the user has previously joined: serverURL, poolID, memberPublicKeyBase64, displayName, firstJoinedAt, lastSuccessfulConnectAt. Stored via the pluggable `remotePoolStateStorageProvider`. |
 | `ServerFrame` | All WebSocket frame types for client-server communication (HostAuth, Forward, JoinRequest, tunnel control plane, `pool_host_status`, etc.). |
 | `BlockedDevice` | A blocked device entry with peer ID, display name, reason, and timestamp. |
 | `TunnelDestination` | Tagged union of `.hostname(host:port:)`, `.ipv4(address:port:)`, `.ipv6(address:port:)` for `tunnel_open`. |
