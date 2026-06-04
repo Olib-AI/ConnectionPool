@@ -282,7 +282,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Olib-AI/ConnectionPool.git", from: "1.5.1")
+    .package(url: "https://github.com/Olib-AI/ConnectionPool.git", from: "1.6.0")
 ]
 ```
 
