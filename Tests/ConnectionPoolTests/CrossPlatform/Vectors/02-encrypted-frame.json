@@ -1,0 +1,62 @@
+{
+  "_spec": "docs/pvp-transport-spec.md §3, §4.3, §4.4, §5.4",
+  "_purpose": "Encrypted-frame byte layout for types 0x01, 0x03, 0x04, 0x05 — keys derived from §4.2 inputs.",
+  "keys": {
+    "K_c2s_hex": "b59561b63a5fe76f7862ad15f4f380a0fd90d7e65a5148b333789ff074b8512d",
+    "K_s2c_hex": "51a32d8735fdb8165a1f8449fd270c922082d0f07a3a4236303632ffa731836e"
+  },
+  "frames": {
+    "ping_c2s_counter0": {
+      "frame_type": 3,
+      "counter": 0,
+      "nonce_hex": "000000000000000000000000",
+      "aad_hex": "03",
+      "plaintext_b64": "",
+      "plaintext_utf8": null,
+      "ciphertext_hex": "",
+      "tag_hex": "e64ff5604e2ba56047650d95efc72b65",
+      "body_hex": "030000000000000000e64ff5604e2ba56047650d95efc72b65",
+      "frame_hex": "00000019030000000000000000e64ff5604e2ba56047650d95efc72b65",
+      "frame_length": 29
+    },
+    "pong_s2c_counter0": {
+      "frame_type": 4,
+      "counter": 0,
+      "nonce_hex": "000000000000000000000000",
+      "aad_hex": "04",
+      "plaintext_b64": "",
+      "plaintext_utf8": null,
+      "ciphertext_hex": "",
+      "tag_hex": "fa91d9480ecc9d01df59f51ebd90cd6a",
+      "body_hex": "040000000000000000fa91d9480ecc9d01df59f51ebd90cd6a",
+      "frame_hex": "00000019040000000000000000fa91d9480ecc9d01df59f51ebd90cd6a",
+      "frame_length": 29
+    },
+    "encrypted_pool_message_s2c_counter1_small": {
+      "frame_type": 1,
+      "counter": 1,
+      "nonce_hex": "000000000000000000000001",
+      "aad_hex": "01",
+      "plaintext_b64": "eyJoZWxsbyI6IndvcmxkIn0=",
+      "plaintext_utf8": "{\"hello\":\"world\"}",
+      "ciphertext_hex": "e2b2b05689ba3aa9463c6f7512d0b57918",
+      "tag_hex": "145e0782f25f3d2d58abf43c82a67e30",
+      "body_hex": "010000000000000001e2b2b05689ba3aa9463c6f7512d0b57918145e0782f25f3d2d58abf43c82a67e30",
+      "frame_hex": "0000002a010000000000000001e2b2b05689ba3aa9463c6f7512d0b57918145e0782f25f3d2d58abf43c82a67e30",
+      "frame_length": 46
+    },
+    "bye_with_reason_s2c_counter2": {
+      "frame_type": 5,
+      "counter": 2,
+      "nonce_hex": "000000000000000000000002",
+      "aad_hex": "05",
+      "plaintext_b64": "Z29vZGJ5ZQ==",
+      "plaintext_utf8": "goodbye",
+      "ciphertext_hex": "788df4cd4466a8",
+      "tag_hex": "2bc4185933faee19c8c996c1a214aea8",
+      "body_hex": "050000000000000002788df4cd4466a82bc4185933faee19c8c996c1a214aea8",
+      "frame_hex": "00000020050000000000000002788df4cd4466a82bc4185933faee19c8c996c1a214aea8",
+      "frame_length": 36
+    }
+  }
+}

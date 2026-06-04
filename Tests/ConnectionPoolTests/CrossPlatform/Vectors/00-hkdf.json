@@ -1,0 +1,20 @@
+{
+  "_spec": "docs/pvp-transport-spec.md §4.2",
+  "_purpose": "Derive K_master, K_c2s, K_s2c from tap_code, nonce_c, nonce_h.",
+  "inputs": {
+    "tap_code": "482917",
+    "nonce_c_hex": "000102030405060708090a0b0c0d0e0f",
+    "nonce_h_hex": "101112131415161718191a1b1c1d1e1f",
+    "salt_hex (nonce_c||nonce_h)": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "ikm_hex (utf8('chessup-pvp/v1')||utf8(tap_code))": "636865737375702d7076702f7631343832393137",
+    "info_master": "chessup-pvp/v1/master",
+    "info_c2s": "chessup-pvp/v1/c2s",
+    "info_s2c": "chessup-pvp/v1/s2c",
+    "length": 32
+  },
+  "expected": {
+    "K_master_hex": "9a91a6d192e503f8fe34453323ff6e32e941964888e59833cf8483c8a1d9cbc7",
+    "K_c2s_hex": "b59561b63a5fe76f7862ad15f4f380a0fd90d7e65a5148b333789ff074b8512d",
+    "K_s2c_hex": "51a32d8735fdb8165a1f8449fd270c922082d0f07a3a4236303632ffa731836e"
+  }
+}

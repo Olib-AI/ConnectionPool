@@ -1,0 +1,45 @@
+{
+  "_spec": "docs/pvp-transport-spec.md §5.1",
+  "_purpose": "Canonical handshake JSON byte sequences (plaintext, framed under type 0x02).",
+  "client_hello": {
+    "object": {
+      "v": 1,
+      "kind": "client_hello",
+      "pid": "QEFCQ0RFRkdISUpLTE1OTw",
+      "name": "Alice",
+      "nonce_c": "AAECAwQFBgcICQoLDA0ODw",
+      "code_hash": "bc2TLgF4M8WLE0C22Kj0Ag",
+      "cap": "chess.1",
+      "resume": null
+    },
+    "utf8_bytes_hex": "7b22636170223a2263686573732e31222c22636f64655f68617368223a22626332544c6746344d38574c45304332324b6a304167222c226b696e64223a22636c69656e745f68656c6c6f222c226e616d65223a22416c696365222c226e6f6e63655f63223a2241414543417751464267634943516f4c4441304f4477222c22706964223a225145464351305246526b64495355704c5445314f5477222c22726573756d65223a6e756c6c2c2276223a317d"
+  },
+  "server_hello_ok": {
+    "object": {
+      "v": 1,
+      "kind": "server_hello",
+      "ok": true,
+      "pid": "UFFSU1RVVldYWVpbXF1eXw",
+      "name": "Bob",
+      "nonce_h": "EBESExQVFhcYGRobHB0eHw",
+      "session_id": "ICEiIyQlJicoKSorLC0uLw",
+      "host_color": "white",
+      "starting_fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    },
+    "utf8_bytes_hex": "7b22686f73745f636f6c6f72223a227768697465222c226b696e64223a227365727665725f68656c6c6f222c226e616d65223a22426f62222c226e6f6e63655f68223a2245424553457851564668635947526f62484230654877222c226f6b223a747275652c22706964223a225546465355315256566c645957567062584631655877222c2273657373696f6e5f6964223a22494345694979516c4a69636f4b536f724c4330754c77222c227374617274696e675f66656e223a22726e62716b626e722f70707070707070702f382f382f382f382f50505050505050502f524e42514b424e522077204b516b71202d20302031222c2276223a317d"
+  },
+  "server_hello_bad_code": {
+    "object": {
+      "v": 1,
+      "kind": "server_hello",
+      "ok": false,
+      "err": "bad_code"
+    },
+    "utf8_bytes_hex": "7b22657272223a226261645f636f6465222c226b696e64223a227365727665725f68656c6c6f222c226f6b223a66616c73652c2276223a317d"
+  },
+  "code_hash_derivation": {
+    "input_utf8": "482917",
+    "sha256_first_16_hex": "6dcd932e017833c58b1340b6d8a8f402",
+    "sha256_first_16_b64url": "bc2TLgF4M8WLE0C22Kj0Ag"
+  }
+}

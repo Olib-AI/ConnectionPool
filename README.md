@@ -1,6 +1,6 @@
 # ConnectionPool
 
-**A zero-dependency P2P mesh networking library for iOS and macOS with local and remote relay support by [Olib AI](https://www.olib.ai)**
+**A zero-dependency P2P mesh networking library for iOS and macOS with local and remote relay support — plus a cross-platform transport for Android interop — by [Olib AI](https://www.olib.ai)**
 
 Used in [StealthOS](https://www.stealthos.app) — The privacy-focused operating environment.
 
@@ -17,6 +17,7 @@ ConnectionPool is a Swift package that builds a secure mesh network with two tra
 
 1. **Local mode** — MultipeerConnectivity over Wi-Fi and Bluetooth. No internet required.
 2. **Remote mode** — WebSocket transport via [StealthRelay](https://github.com/Olib-AI/StealthRelay), a self-hosted Rust relay server. Connect from anywhere.
+3. **Cross-platform mode** — Bonjour/mDNS + TCP with a platform-neutral wire protocol, interoperable with **Android** peers. Swift and Kotlin devices join the same session over the local network.
 
 Both modes enforce end-to-end encryption, authenticate joiners with pool codes or invitation tokens, and protect relay envelopes with HMAC-SHA256. The library was built for StealthOS, where "privacy by default" is not a feature — it is the architecture.
 
@@ -63,6 +64,18 @@ Zero external dependencies. Everything ships in one Swift package.
 - **Binary hot-path frames** — `TUNNEL_DATA` (`0x01`) and `TUNNEL_UDP` (`0x02`) ride binary WebSocket frames with a fixed-size big-endian header (no base64, no JSON parse on the byte path). Control plane (open / close / window_update / dns / error) stays JSON for debuggability
 - **Credit-based flow control** — Per-stream send-credit window (256 KiB initial; relay grants additional credit via `tunnel_window_update` as it consumes bytes). Stops the WebSocket from getting evicted by the relay's slow-consumer threshold under sustained traffic
 - **Tunnel kill switch** — A `tunnel_close { reason: "policy_denied" }` from the relay (server flag off, per-pool flag off, denied CIDR/port) trips a `RelayTunnelKillSwitchTriggered` notification consumers can hook to block all egress until the user resolves it
+
+### Cross-Platform Transport (Android Interop)
+
+- **Android interoperability** — The `CrossPlatform` module speaks a platform-neutral wire protocol with a matching Kotlin implementation, so iOS and Android devices can discover each other and exchange encrypted messages over the local network
+- **Canonical JSON wire format** — Keys sorted by Unicode code point, no insignificant whitespace, ISO-8601 millisecond timestamps, RFC-4648 padded base64 payloads — guaranteeing byte-identical encoding across Swift and Kotlin
+- **Bonjour/mDNS + TCP discovery** — `NWListener` advertising and `NWBrowser` browsing with TXT records; uses a service type disjoint from the MultipeerConnectivity transport so the two never collide
+- **ChaCha20-Poly1305 + HKDF-SHA256** — A 6-digit tap code plus per-side handshake nonces derive directional session keys; frames are length-prefixed AEAD with strict monotone sequence counters and replay rejection
+- **Session resume** — Guests reconnect after a drop and re-handshake under fresh keys; the host replays unacknowledged frames from its outbound buffer
+- **Host-side hardening** — Per-IP hello rate limiting, handshake timeouts, device blocking, and a closed error taxonomy mirrored on both platforms
+- **Transport-agnostic core** — `CrossPlatformPool` operates on a `RawConnection` abstraction; production wraps `NWConnection` via `SocketConnection`, tests use in-memory pairs
+- **Frozen reference vectors** — Cross-platform compatibility is locked by shared test vectors (HKDF, handshake, encrypted frames, game actions) asserted byte-equal on both the Swift and Kotlin sides
+- **Fully coexistent** — A separate type set (`CrossPlatformPoolMessage`, `CrossPlatformTransportError`, …) keeps the legacy MultipeerConnectivity and relay wire formats byte-identical for existing consumers
 
 ## Architecture
 

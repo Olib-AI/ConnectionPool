@@ -1,0 +1,74 @@
+{
+  "_spec": "docs/pvp-transport-spec.md §5.2.3 (per ADR-0004 §3)",
+  "_purpose": "Canonical JSON byte shapes for the 5 ChessGameAction variants not pinned in vector 03.",
+  "cases": [
+    {
+      "name": "resign",
+      "action_object": {
+        "resign": {}
+      },
+      "utf8_bytes_hex": "7b2272657369676e223a7b7d7d",
+      "utf8_bytes_b64": "eyJyZXNpZ24iOnt9fQ==",
+      "utf8_string": "{\"resign\":{}}"
+    },
+    {
+      "name": "offerDraw",
+      "action_object": {
+        "offerDraw": {}
+      },
+      "utf8_bytes_hex": "7b226f6666657244726177223a7b7d7d",
+      "utf8_bytes_b64": "eyJvZmZlckRyYXciOnt9fQ==",
+      "utf8_string": "{\"offerDraw\":{}}"
+    },
+    {
+      "name": "acceptDraw",
+      "action_object": {
+        "acceptDraw": {}
+      },
+      "utf8_bytes_hex": "7b2261636365707444726177223a7b7d7d",
+      "utf8_bytes_b64": "eyJhY2NlcHREcmF3Ijp7fX0=",
+      "utf8_string": "{\"acceptDraw\":{}}"
+    },
+    {
+      "name": "declineDraw",
+      "action_object": {
+        "declineDraw": {}
+      },
+      "utf8_bytes_hex": "7b226465636c696e6544726177223a7b7d7d",
+      "utf8_bytes_b64": "eyJkZWNsaW5lRHJhdyI6e319",
+      "utf8_string": "{\"declineDraw\":{}}"
+    },
+    {
+      "name": "emote_crown",
+      "action_object": {
+        "emote": {
+          "emoji": "👑"
+        }
+      },
+      "utf8_bytes_hex": "7b22656d6f7465223a7b22656d6f6a69223a22f09f9191227d7d",
+      "utf8_bytes_b64": "eyJlbW90ZSI6eyJlbW9qaSI6IvCfkZEifX0=",
+      "utf8_string": "{\"emote\":{\"emoji\":\"👑\"}}"
+    },
+    {
+      "name": "emote_fire",
+      "action_object": {
+        "emote": {
+          "emoji": "🔥"
+        }
+      },
+      "utf8_bytes_hex": "7b22656d6f7465223a7b22656d6f6a69223a22f09f94a5227d7d",
+      "utf8_bytes_b64": "eyJlbW90ZSI6eyJlbW9qaSI6IvCflKUifX0=",
+      "utf8_string": "{\"emote\":{\"emoji\":\"🔥\"}}"
+    }
+  ],
+  "chessup_emote_set": [
+    "🔥",
+    "👏",
+    "🤔",
+    "😈",
+    "🤯",
+    "🤝",
+    "😅",
+    "👑"
+  ]
+}
