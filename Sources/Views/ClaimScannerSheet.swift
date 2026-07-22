@@ -13,17 +13,22 @@ struct ClaimScannerSheet: View {
     @Binding var isPresented: Bool
     let onScanned: () -> Void
 
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
-                Text("Scan Server Claim QR")
-                    .font(.headline)
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
-                Text("Point your camera at the QR code shown in your server's Docker logs.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
+        NavigationStack {
+            VStack(spacing: theme.spacingL) {
+                PoolText("connectionpool.claim.title", fallback: "Scan Server Claim QR")
+                    .font(theme.fontHeading)
+                    .foregroundColor(theme.textPrimary)
+
+                PoolText("connectionpool.claim.subtitle", fallback: "Point your camera at the QR code shown in your server's Docker logs.")
+                    .font(theme.fontCaption)
+                    .foregroundColor(theme.textSecondary)
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                    .padding(.horizontal, theme.spacingL)
 
                 #if os(iOS)
                 QRScannerView { code in
@@ -32,25 +37,26 @@ struct ClaimScannerSheet: View {
                     onScanned()
                 }
                 .frame(maxWidth: .infinity, maxHeight: 300)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .padding()
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
+                .padding(theme.spacingL)
                 #else
                 Spacer()
-                Image(systemName: "camera.fill")
-                    .font(.system(size: 40))
-                    .foregroundStyle(.secondary)
-                Text("Camera scanning is only available on iOS")
-                    .foregroundStyle(.secondary)
+                PoolIcon("camera", size: 40, systemFallback: "camera.fill")
+                    .foregroundColor(theme.textSecondary)
+                PoolText("connectionpool.claim.iosOnly", fallback: "Camera scanning is only available on iOS")
+                    .foregroundColor(theme.textSecondary)
                 Spacer()
                 #endif
             }
-            .navigationTitle("Scan QR Code")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.background.ignoresSafeArea())
+            .navigationTitle(poolString("connectionpool.claim.navTitle", fallback: "Scan QR Code"))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
+                    Button(poolString("common.cancel", fallback: "Cancel")) { isPresented = false }
                 }
             }
         }

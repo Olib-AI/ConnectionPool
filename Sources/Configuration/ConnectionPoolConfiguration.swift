@@ -5,6 +5,7 @@
 // StealthOS - stealthos.app
 
 import Foundation
+import SwiftUI
 
 /// Protocol for pluggable block list storage.
 ///
@@ -54,4 +55,38 @@ public enum ConnectionPoolConfiguration {
     /// Set this at app startup alongside the logger, before any ConnectionPool
     /// APIs are used.
     @MainActor public static var remotePoolStateStorageProvider: (any BlockListStorageProvider)?
+
+    // MARK: - UI design injection seams
+    //
+    // ConnectionPool (and PoolChat, which depends on it) cannot import the app's
+    // ThemeKit / IconKit / LanguageKit. The host wires these three seams from
+    // `App/Integration/ConnectionPoolBridge.swift` so the pool UI adopts the
+    // active theme, iconography, and language. All three delegate to the shared
+    // `PoolDesign` store the pool views observe. When unset the package falls
+    // back to neutral colors, its built-in English strings, and SF Symbols.
+
+    /// Resolves a `PoolThemeSnapshot` of the live theme tokens for a color scheme.
+    @MainActor public static var themeResolver: (@MainActor (ColorScheme) -> PoolThemeSnapshot)? {
+        get { PoolDesign.shared.themeResolver }
+        set { PoolDesign.shared.themeResolver = newValue }
+    }
+
+    /// Resolves a LanguageKit key (+ optional interpolation args) to a string.
+    @MainActor public static var stringProvider: (@MainActor (String, [String: String]?) -> String)? {
+        get { PoolDesign.shared.stringProvider }
+        set { PoolDesign.shared.stringProvider = newValue }
+    }
+
+    /// Renders an FA icon name at a point size + weight (host uses IconKit).
+    @MainActor public static var iconRenderer: (@MainActor (String, CGFloat, PoolIconWeight) -> AnyView)? {
+        get { PoolDesign.shared.iconRenderer }
+        set { PoolDesign.shared.iconRenderer = newValue }
+    }
+
+    /// Notify the pool UI that the theme, appearance, or language changed so it
+    /// re-renders. The host calls this on any `ThemeEngine` / `LanguageEngine`
+    /// change.
+    @MainActor public static func notifyDesignChanged() {
+        PoolDesign.shared.invalidate()
+    }
 }

@@ -628,6 +628,18 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         log("ConnectionPool disconnected by user action", category: .runtime)
     }
 
+    /// Called when this peer receives a `.removedFromPool` control signal from the host.
+    ///
+    /// Cooperatively leaves the pool via the member-side `disconnect()` (tears down both
+    /// the local MC session and any remote WebSocket) and surfaces a clear notice. The
+    /// host has also enabled enforcement + (for a block) a durable block-list entry, so a
+    /// non-cooperative or repeat attempt is dropped / rejected on re-join.
+    private func handleRemovedFromPool() {
+        log("Received removal signal from host — leaving pool", category: .network)
+        disconnect()
+        showError(message: "You have been removed from the pool.")
+    }
+
     /// Accept an invitation
     public func acceptInvitation(_ invitation: DiscoveredPeer) {
         // Track this peer's ID so reconnections are auto-accepted
@@ -679,15 +691,27 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         rejectInvitation(invitation)
     }
 
-    /// Kick a peer from the pool (host only)
+    /// Kick a peer from the pool (host only).
+    ///
+    /// Sends the cooperative removed-signal, performs the remote server kick (remote
+    /// pools), and enables host-side enforcement so the peer is dropped on both
+    /// transports. Does not block the peer — use `blockPeer(_:)` for that.
     public func kickPeer(_ peer: Peer) {
-        // TODO: Implement kick functionality in ConnectionPoolManager
         log("Kicking peer: \(peer.displayName)", category: .network)
+        poolManager.kickPeer(peerID: peer.id, displayName: peer.effectiveDisplayName)
+        // Mirror the roster change locally for remote pools, where the VM owns the list.
+        connectedPeers.removeAll { $0.id == peer.id }
     }
 
-    /// Block a connected peer (host only) - also kicks them
+    /// Block a connected peer (host only) - also kicks them.
+    ///
+    /// `blockDevice` now performs the full enforced kick (cooperative removed-signal +
+    /// remote server kick + host-side enforcement) in addition to the durable block-list
+    /// entry, so a currently-connected blocked user is actually disconnected.
     public func blockPeer(_ peer: Peer) {
         poolManager.blockDevice(peer.id, displayName: peer.effectiveDisplayName)
+        // Mirror the roster change locally for remote pools, where the VM owns the list.
+        connectedPeers.removeAll { $0.id == peer.id }
         refreshBlockedDevices()
     }
 
@@ -733,10 +757,18 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             return
         }
 
+        // FAIL-CLOSED INVARIANT (netsec audit: ws-cleartext-lan): relay connections must be
+        // TLS (wss://) — plaintext ws:// exposes pool metadata (display names, peer IDs,
+        // public keys, timing) to on-path/LAN observers and silently bypasses SPKI pinning.
+        if trimmed.hasPrefix("ws://") {
+            showError(message: "Insecure ws:// relay URLs are not supported. Use wss:// (TLS).")
+            return
+        }
+
         // Normalize the URL: add wss:// scheme if missing.
         // Default to wss:// for all connections to ensure encryption.
         let normalized: String
-        if trimmed.hasPrefix("wss://") || trimmed.hasPrefix("ws://") {
+        if trimmed.hasPrefix("wss://") {
             normalized = trimmed
         } else {
             // Default to wss:// for all raw addresses (encrypted by default)
@@ -806,7 +838,12 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             return
         }
 
-        if !normalized.hasPrefix("ws://") && !normalized.hasPrefix("wss://") {
+        // FAIL-CLOSED (netsec audit: ws-cleartext-lan): reject plaintext ws:// — see createRemotePool.
+        if normalized.hasPrefix("ws://") {
+            showError(message: "Insecure ws:// relay URLs are not supported. Use wss:// (TLS).")
+            return
+        }
+        if !normalized.hasPrefix("wss://") {
             normalized = "wss://\(normalized)"
         }
 
@@ -1252,6 +1289,15 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
         case .system:
             if let payload = message.decodePayload(as: SystemPayload.self) {
+                // Control event: the host removed us from the pool. Honor it by leaving
+                // and surfacing a clear notice. Guard on targetPeerID so a stray/relayed
+                // removal aimed at another peer is never acted on by us.
+                if payload.event == .removedFromPool,
+                   payload.targetPeerID == nil || payload.targetPeerID == poolManager.localPeerID {
+                    handleRemovedFromPool()
+                    return
+                }
+
                 let systemMessage = ChatMessage(
                     id: message.id,
                     senderID: "system",

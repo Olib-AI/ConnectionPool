@@ -17,7 +17,9 @@ import UniformTypeIdentifiers
 public struct ReceiveInvitationView: View {
 
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var scheme
 
     @State private var openError: String?
     @State private var isPickingFile = false
@@ -28,57 +30,75 @@ public struct ReceiveInvitationView: View {
     }
 
     public var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Receive an Invitation")
-                            .font(.headline)
-                        Text("Open the invite card your friend sent you. The file ends in .stcard and arrives via Messages, AirDrop, Mail, or Files.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: theme.spacingL) {
+                    VStack(alignment: .leading, spacing: theme.spacingXS + 2) {
+                        PoolText("connectionpool.receive.title", fallback: "Receive an Invitation")
+                            .font(theme.fontHeading)
+                            .foregroundColor(theme.textPrimary)
+                        PoolText("connectionpool.receive.subtitle", fallback: "Open the invite card your friend sent you. The file ends in .stcard and arrives via Messages, AirDrop, Mail, or Files.")
+                            .font(theme.fontBody)
+                            .foregroundColor(theme.textSecondary)
                     }
 
                     #if canImport(UIKit)
                     Button {
                         isPickingFile = true
                     } label: {
-                        Label("Open invite card from Files", systemImage: "folder")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(Color.blue)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        HStack(spacing: theme.spacingS) {
+                            PoolIcon("folder-open", size: 16, systemFallback: "folder")
+                            PoolText("connectionpool.receive.openFromFiles", fallback: "Open invite card from Files")
+                        }
+                        .font(theme.fontBody)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, theme.spacingM)
+                        .background(theme.accent)
+                        .foregroundColor(theme.textOnAccent)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     }
 
                     Button {
                         isScanningQR = true
                     } label: {
-                        Label("Scan invite QR code", systemImage: "qrcode.viewfinder")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(Color.purple)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        HStack(spacing: theme.spacingS) {
+                            PoolIcon("qrcode", size: 16, systemFallback: "qrcode.viewfinder")
+                            PoolText("connectionpool.receive.scanQR", fallback: "Scan invite QR code")
+                        }
+                        .font(theme.fontBody)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, theme.spacingM)
+                        .foregroundColor(theme.accent)
+                        .background(theme.surfaceSecondary)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous)
+                                .strokeBorder(theme.border, lineWidth: 1)
+                        )
                     }
 
-                    Text("Tip: in Messages, tap and hold the file → Share → StealthOS. Or have the host show the QR.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.receive.tip", fallback: "Tip: in Messages, tap and hold the file → Share → StealthOS. Or have the host show the QR.")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                     #endif
 
                     if let openError {
-                        Label(openError, systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.red)
+                        HStack(spacing: theme.spacingS) {
+                            PoolIcon("triangle-exclamation", size: 14, systemFallback: "exclamationmark.triangle.fill")
+                            Text(openError)
+                        }
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.danger)
                     }
                 }
-                .padding()
+                .padding(theme.spacingL)
             }
-            .navigationTitle("Receive Invitation")
+            .background(theme.background.ignoresSafeArea())
+            .navigationTitle(poolString("connectionpool.receive.navTitle", fallback: "Receive Invitation"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                    Button(poolString("common.done", fallback: "Done")) { dismiss() }
                 }
             }
         }
@@ -98,7 +118,7 @@ public struct ReceiveInvitationView: View {
                     if let bytes = SealedInviteCard.decodeFromQRText(text) {
                         Task { await openCardBytes(bytes) }
                     } else {
-                        openError = "That QR code isn't a StealthOS invite card."
+                        openError = poolString("connectionpool.receive.badQR", fallback: "That QR code isn't a StealthOS invite card.")
                     }
                 },
                 onBytes: { bytes in
@@ -153,7 +173,8 @@ private struct QRInviteScanSheet: View {
                 .ignoresSafeArea()
                 VStack {
                     Spacer()
-                    Text("Point at the host's invite QR")
+                    // White-on-scrim over the live camera (functional overlay).
+                    PoolText("connectionpool.qr.pointAtHost", fallback: "Point at the host's invite QR")
                         .font(.callout)
                         .foregroundStyle(.white)
                         .padding(.horizontal, 14)
@@ -163,11 +184,11 @@ private struct QRInviteScanSheet: View {
                         .padding(.bottom, 32)
                 }
             }
-            .navigationTitle("Scan Invite")
+            .navigationTitle(poolString("connectionpool.qr.scanInvite", fallback: "Scan Invite"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: onCancel)
+                    Button(poolString("common.cancel", fallback: "Cancel"), action: onCancel)
                 }
             }
         }

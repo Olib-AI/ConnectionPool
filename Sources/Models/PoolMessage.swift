@@ -117,6 +117,30 @@ public struct PoolMessage: Identifiable, Codable, Sendable {
         )
     }
 
+    /// Create a typed system-event message (e.g. "you were removed from the pool").
+    ///
+    /// Rides the existing `.system` message path so it flows through both the local
+    /// MultipeerConnectivity pipeline and the remote WebSocket transport unchanged.
+    /// The extra fields in `SystemPayload` are optional, so a plain informational
+    /// system message (no `event`) decodes exactly as before — wire-compatible.
+    public static func systemEvent(
+        from senderID: String,
+        senderName: String,
+        event: PoolSystemEvent,
+        targetPeerID: String,
+        text: String
+    ) -> PoolMessage {
+        let systemPayload = SystemPayload(text: text, event: event, targetPeerID: targetPeerID)
+        let payloadData = (try? JSONEncoder().encode(systemPayload)) ?? Data()
+        return PoolMessage(
+            type: .system,
+            senderID: senderID,
+            senderName: senderName,
+            payload: payloadData,
+            isReliable: true
+        )
+    }
+
     /// Create a key exchange message for E2E encryption
     public static func keyExchange(
         from senderID: String,
@@ -189,12 +213,33 @@ public struct ChatPayload: Codable, Sendable {
     }
 }
 
-/// Payload for system messages
+/// A typed control event carried by a `.system` message.
+///
+/// Used for administrative signals that a peer must act on, as opposed to plain
+/// informational chat notices. New cases can be added without breaking older
+/// clients: an unknown raw value simply decodes as `nil` (the field is optional).
+public enum PoolSystemEvent: String, Codable, Sendable {
+    /// The host removed the recipient from the pool. On receipt, the targeted peer
+    /// leaves the pool (member-side `disconnect()`) and surfaces a notice.
+    case removedFromPool = "removed_from_pool"
+}
+
+/// Payload for system messages.
+///
+/// `event` / `targetPeerID` are optional and default to `nil`, so a message created
+/// via `SystemPayload(text:)` encodes to the exact same JSON as before this field was
+/// added — existing peers decode it unchanged (forward/backward compatible).
 public struct SystemPayload: Codable, Sendable {
     public let text: String
+    /// Optional control event. `nil` for a plain informational system message.
+    public let event: PoolSystemEvent?
+    /// The peer ID this event is directed at. Receivers ignore events not aimed at them.
+    public let targetPeerID: String?
 
-    public init(text: String) {
+    public init(text: String, event: PoolSystemEvent? = nil, targetPeerID: String? = nil) {
         self.text = text
+        self.event = event
+        self.targetPeerID = targetPeerID
     }
 }
 

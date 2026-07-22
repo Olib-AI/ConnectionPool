@@ -328,8 +328,15 @@ public final class RemotePoolService: ObservableObject {
         // directly reachable. Default to wss:// for raw address:port to ensure encryption.
         let serverAddress = wire.addr
         let serverURL: URL
-        if serverAddress.hasPrefix("wss://") || serverAddress.hasPrefix("ws://") {
+        if serverAddress.hasPrefix("wss://") {
             guard let url = URL(string: serverAddress) else { return nil }
+            serverURL = url
+        } else if serverAddress.hasPrefix("ws://") {
+            // FAIL-CLOSED (netsec audit: ws-cleartext-lan): never join over plaintext.
+            // Upgrade an invitation-supplied ws:// address to wss:// — either the relay
+            // speaks TLS and the join works, or the connection fails; it never talks
+            // cleartext on an attacker-supplied address.
+            guard let url = URL(string: "wss://" + serverAddress.dropFirst("ws://".count)) else { return nil }
             serverURL = url
         } else {
             // Default to wss:// for raw address:port (encrypted by default)
