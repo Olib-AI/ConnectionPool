@@ -332,3 +332,35 @@ public func poolString(_ key: String, fallback: String, args: [String: String]? 
         PoolDesign.shared.string(key, args, fallback: fallback)
     }
 }
+
+// MARK: - Deferred Label
+
+/// Builds its content inside `body` instead of at the call site.
+///
+/// Some SwiftUI builder closures are declared `@Sendable` in the SDK - notably
+/// `PhotosPicker(selection:matching:label:)`. A `@Sendable` closure does not
+/// inherit the caller's actor isolation, so its body is nonisolated even though
+/// SwiftUI only ever runs it while evaluating a view body on the main actor.
+/// That makes themed views such as `PoolIcon` (which stores the `@MainActor`
+/// `PoolDesign.shared` as an `@ObservedObject`, and therefore has a main-actor
+/// isolated initializer) unusable directly inside those closures.
+///
+/// This wrapper stores the content as a `@MainActor` closure - creating a closure
+/// is nonisolated, only calling it is not - and invokes it from `body`, which is
+/// main-actor isolated. Rendering is unchanged: `body` returns the content
+/// verbatim, with no added layout.
+public struct PoolDeferredLabel<Content: View>: View {
+    @ViewBuilder private let content: @MainActor () -> Content
+
+    /// `nonisolated` because an explicit initializer on a `View` otherwise infers
+    /// `@MainActor` from the conformance, which is exactly the isolation this
+    /// type exists to sidestep. Storing a `@MainActor` closure is safe anywhere;
+    /// only calling it requires the main actor, and that happens in `body`.
+    public nonisolated init(@ViewBuilder content: @escaping @MainActor () -> Content) {
+        self.content = content
+    }
+
+    public var body: some View {
+        content()
+    }
+}
