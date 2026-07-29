@@ -64,14 +64,83 @@ final class PinnedSessionDelegate: NSObject, URLSessionDelegate, @unchecked Send
             return
         }
 
-        // SHA-256 hash the SPKI data and compare against the expected pin.
-        let spkiHash = Data(SHA256.hash(data: publicKeyData))
+        // INVARIANT (netsec audit: spki-header-mismatch-pin-latent): hash the FULL
+        // SubjectPublicKeyInfo (ASN.1 header + raw key), matching CertificatePinningService
+        // and the standard OpenSSL/Chrome/TrustKit pin format — a pin generated with the
+        // documented openssl recipe must match here too.
+        let spkiData = WSSPKIHeader.prependHeader(to: publicKeyData, for: publicKey)
+        let spkiHash = Data(SHA256.hash(data: spkiData))
 
         if spkiHash == expectedHash {
             completionHandler(.useCredential, URLCredential(trust: serverTrust))
         } else {
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
+    }
+}
+
+// MARK: - SPKI Header Constants (mirrors Core.CertificatePinningService's SPKIHeader)
+
+/// ASN.1 DER headers for SubjectPublicKeyInfo (SPKI) wrapping.
+/// `SecKeyCopyExternalRepresentation` returns raw key bytes without the SPKI wrapper;
+/// standard SPKI pinning hashes the full structure. Duplicated here because ConnectionPool
+/// does not depend on the Core package.
+enum WSSPKIHeader {
+
+    // RSA 2048-bit SPKI header (24 bytes)
+    static let rsa2048: [UInt8] = [
+        0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09,
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0f, 0x00,
+    ]
+
+    // RSA 4096-bit SPKI header (24 bytes)
+    static let rsa4096: [UInt8] = [
+        0x30, 0x82, 0x02, 0x22, 0x30, 0x0d, 0x06, 0x09,
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, 0x05, 0x00, 0x03, 0x82, 0x02, 0x0f, 0x00,
+    ]
+
+    // EC P-256 SPKI header (26 bytes)
+    static let ecP256: [UInt8] = [
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+        0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00,
+    ]
+
+    // EC P-384 SPKI header (23 bytes)
+    static let ecP384: [UInt8] = [
+        0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b,
+        0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00,
+    ]
+
+    /// Prepend the correct ASN.1 SPKI header to raw public key data.
+    static func prependHeader(to keyData: Data, for publicKey: SecKey) -> Data {
+        guard let header = selectHeader(for: publicKey, keyDataSize: keyData.count) else {
+            // Unknown key type — fall back to hashing raw data
+            return keyData
+        }
+        return Data(header) + keyData
+    }
+
+    private static func selectHeader(for publicKey: SecKey, keyDataSize: Int) -> [UInt8]? {
+        guard let attributes = SecKeyCopyAttributes(publicKey) as? [CFString: Any],
+              let keyType = attributes[kSecAttrKeyType] as? String else {
+            return nil
+        }
+
+        if keyType == (kSecAttrKeyTypeRSA as String) {
+            // RSA: distinguish 2048 vs 4096 by raw key size
+            return keyDataSize > 400 ? rsa4096 : rsa2048
+        } else if keyType == (kSecAttrKeyTypeEC as String) ||
+                    keyType == (kSecAttrKeyTypeECSECPrimeRandom as String) {
+            // EC: distinguish P-256 (65 bytes) vs P-384 (97 bytes)
+            return keyDataSize > 80 ? ecP384 : ecP256
+        }
+
+        return nil
     }
 }
 
@@ -249,15 +318,22 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// Encrypt data using AES-GCM with the derived WebSocket encryption key.
     /// Returns the original data unchanged if no shared secret is configured yet
     /// (e.g., before pool session establishment).
-    private func encryptForWS(_ plaintext: Data) -> Data {
+    ///
+    /// FAIL-CLOSED INVARIANT (netsec audit: ws-encrypt-fail-open): once a shared secret
+    /// IS configured, an encryption failure must DROP the frame (return nil) — it must
+    /// never silently transmit plaintext that the sender believes is encrypted.
+    private func encryptForWS(_ plaintext: Data) -> Data? {
         guard let key = wsEncryptionKey() else { return plaintext }
         do {
             let sealedBox = try AES.GCM.seal(plaintext, using: key)
-            guard let combined = sealedBox.combined else { return plaintext }
+            guard let combined = sealedBox.combined else {
+                logMessage("[SECURITY] AES-GCM produced no combined box — dropping frame (fail-closed)")
+                return nil
+            }
             return combined
         } catch {
-            logMessage("[SECURITY] AES-GCM encryption failed: \(error.localizedDescription)")
-            return plaintext
+            logMessage("[SECURITY] AES-GCM encryption failed: \(error.localizedDescription) — dropping frame (fail-closed)")
+            return nil
         }
     }
 
@@ -496,7 +572,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     ///   - data: The data to broadcast.
     ///   - reliable: Ignored for WebSocket (always reliable/ordered).
     public func broadcast(_ data: Data, reliable: Bool) {
-        let wireData = encryptForWS(data)
+        // Fail-closed: a nil result means encryption was required but failed — drop.
+        guard let wireData = encryptForWS(data) else { return }
         let base64 = wireData.base64EncodedString()
         let seq = nextSequence()
         sendFrame(.forward(ForwardData(data: base64, targetPeerIds: nil, sequence: seq)))
@@ -513,7 +590,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     ///   - reliable: Ignored for WebSocket (always reliable/ordered).
     public func send(_ data: Data, to peerIDs: [String], reliable: Bool) {
         guard !peerIDs.isEmpty else { return }
-        let wireData = encryptForWS(data)
+        // Fail-closed: a nil result means encryption was required but failed — drop.
+        guard let wireData = encryptForWS(data) else { return }
         let base64 = wireData.base64EncodedString()
         let seq = nextSequence()
         sendFrame(.forward(ForwardData(data: base64, targetPeerIds: peerIDs, sequence: seq)))

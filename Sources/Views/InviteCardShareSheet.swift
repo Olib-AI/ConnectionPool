@@ -16,9 +16,11 @@ import CoreImage.CIFilterBuiltins
 public struct InviteCardShareSheet: View {
 
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
     let invitation: RemoteInvitation
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var scheme
     @State private var fileURL: URL?
     @State private var qrImage: CGImage?
     @State private var error: String?
@@ -29,68 +31,91 @@ public struct InviteCardShareSheet: View {
     }
 
     public var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
             ScrollView {
-                VStack(spacing: 18) {
+                VStack(spacing: theme.spacingL) {
                     if let cg = qrImage {
                         #if canImport(CoreImage)
+                        // QR code renders on a white plate for reliable scanning
+                        // regardless of theme (functional, not chrome).
                         Image(decorative: cg, scale: 1.0)
                             .interpolation(.none)
                             .resizable()
                             .scaledToFit()
                             .frame(width: 240, height: 240)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .padding(theme.spacingM)
+                            .background(Color.white)
+                            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         #endif
                     }
 
-                    Text("Invite Card")
-                        .font(.headline)
+                    PoolText("connectionpool.invite.cardTitle", fallback: "Invite Card")
+                        .font(theme.fontHeading)
+                        .foregroundColor(theme.textPrimary)
 
                     if let url = fileURL {
                         ShareLink(
                             item: url,
-                            subject: Text("StealthOS Invite Card"),
-                            message: Text("Open this in StealthOS to join my pool.")
+                            subject: Text(poolString("connectionpool.invite.shareSubject", fallback: "StealthOS Invite Card")),
+                            message: Text(poolString("connectionpool.invite.shareMessage", fallback: "Open this in StealthOS to join my pool."))
                         ) {
-                            Label("Send invite card", systemImage: "square.and.arrow.up")
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 12)
-                                .background(Color.purple)
-                                .foregroundStyle(.white)
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            HStack(spacing: theme.spacingS) {
+                                PoolIcon("arrow-up-from-bracket", size: 16, systemFallback: "square.and.arrow.up")
+                                PoolText("connectionpool.invite.sendCard", fallback: "Send invite card")
+                            }
+                            .font(theme.fontBody)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, theme.spacingM)
+                            .background(theme.accent)
+                            .foregroundColor(theme.textOnAccent)
+                            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         }
                     }
 
                     if !invitation.isExpired {
-                        Text("Expires \(invitation.expiresAt, style: .relative)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text(poolString("connectionpool.invite.expires", fallback: "Expires") + " ")
+                            .font(theme.fontCaption)
+                            .foregroundColor(theme.textSecondary)
+                        + Text(invitation.expiresAt, style: .relative)
+                            .font(theme.fontCaption)
+                            .foregroundColor(theme.textSecondary)
                     } else {
-                        Text("Expired").font(.caption).foregroundStyle(.red)
+                        PoolText("connectionpool.invite.expired", fallback: "Expired")
+                            .font(theme.fontCaption)
+                            .foregroundColor(theme.danger)
                     }
 
-                    DisclosureGroup("Help your friend open it") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("In Messages they tap and hold the file → Share → StealthOS.")
-                            Text("Or save it to Files and open it from inside StealthOS.")
-                            Text("Or scan the QR code from inside StealthOS.")
+                    DisclosureGroup(poolString("connectionpool.invite.helpTitle", fallback: "Help your friend open it")) {
+                        VStack(alignment: .leading, spacing: theme.spacingXS + 2) {
+                            PoolText("connectionpool.invite.help1", fallback: "In Messages they tap and hold the file → Share → StealthOS.")
+                            PoolText("connectionpool.invite.help2", fallback: "Or save it to Files and open it from inside StealthOS.")
+                            PoolText("connectionpool.invite.help3", fallback: "Or scan the QR code from inside StealthOS.")
                         }
-                        .font(.callout)
-                        .padding(.vertical, 6)
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.vertical, theme.spacingXS + 2)
                     }
+                    .font(theme.fontBody)
+                    .tint(theme.accent)
+                    .foregroundColor(theme.textPrimary)
 
                     if let error {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.red)
+                        HStack(spacing: theme.spacingS) {
+                            PoolIcon("triangle-exclamation", size: 14, systemFallback: "exclamationmark.triangle.fill")
+                            Text(error)
+                        }
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.danger)
                     }
                 }
-                .padding()
+                .padding(theme.spacingL)
             }
-            .navigationTitle("Invite a Friend")
+            .background(theme.background.ignoresSafeArea())
+            .navigationTitle(poolString("connectionpool.invite.navTitle", fallback: "Invite a Friend"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                    Button(poolString("common.done", fallback: "Done")) { dismiss() }
                 }
             }
             .onAppear { build() }

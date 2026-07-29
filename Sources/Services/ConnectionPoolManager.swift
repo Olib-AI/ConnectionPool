@@ -107,6 +107,8 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Add a remote peer to the connected peers list.
     /// Called by the ViewModel when a peer connects via WebSocket.
     public func addRemotePeer(_ peer: Peer) {
+        // A peer that legitimately (re)joins is no longer under removal enforcement.
+        removedPeerIDs.remove(peer.id)
         if !connectedPeers.contains(where: { $0.id == peer.id }) {
             connectedPeers.append(peer)
             peerEvent.send(.connected(peer))
@@ -235,6 +237,18 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Block list service for persistent device blocking
     private let blockListService = DeviceBlockListService.shared
+
+    /// Peer IDs the host has removed (kicked or blocked) from this pool.
+    ///
+    /// ENFORCEMENT (host-side): MultipeerConnectivity has no API to force a specific
+    /// connected peer off — `session.disconnect()` would drop everyone. A cooperative
+    /// peer honors the `.removedFromPool` control signal and leaves on its own. For a
+    /// non-cooperative peer whose MC link lingers, the host consults this set to (a) DROP
+    /// any inbound traffic from them and (b) exclude them from every outbound/relay send,
+    /// so they are effectively severed from the pool's message flow. Cleared when a peer
+    /// legitimately (re)connects — see `addConnectedPeer`. Transient (not persisted); the
+    /// block list handles durable exclusion across sessions.
+    private var removedPeerIDs: Set<String> = []
 
     /// Mesh relay service for multi-hop message routing through the mesh network.
     /// Initialized lazily after peerID is set up so we have the local peer identifier.
@@ -1113,6 +1127,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         peerIDMap = [:]
         discoveredMCPeers = [:]
         peerConnectionTimes = [:]
+        removedPeerIDs = []
         pendingInvitations = [:]
         // NOTE: failedAttemptCounts is intentionally NOT cleared on disconnect.
         // It is persisted to UserDefaults so brute-force counters survive pool recreation.
@@ -1171,23 +1186,80 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         blockListService.blockedDevices
     }
 
-    /// Manually block a device and kick it if connected
+    /// Manually block a device and kick it if currently connected.
+    ///
+    /// FIX: The previous implementation only called `session.cancelConnectPeer(_:)`, which
+    /// cancels an *in-progress* connection attempt and is a NO-OP on an already-connected
+    /// peer — so a connected blocked user stayed online. It now performs the full kick
+    /// (cooperative removed-signal + remote server kick + host-side enforcement) so a
+    /// currently-connected blocked user is actually severed, in addition to the durable
+    /// block-list entry that prevents them from re-joining.
     public func blockDevice(_ peerID: String, displayName: String) {
         blockListService.blockDevice(peerID, displayName: displayName, reason: .manual)
 
-        // Kick the peer if currently connected
-        if let mcPeerID = self.peerIDMap.first(where: { $0.value == peerID })?.key,
-           let session = session {
-            session.cancelConnectPeer(mcPeerID)
-            removeConnectedPeer(mcPeerID)
-            log("Kicked blocked peer: \(displayName)", category: .network)
-        }
+        // Perform the same enforced kick used by `kickPeer` so a connected blocked
+        // user is dropped on both local (MC) and remote (WebSocket) transports.
+        performRemoval(peerID: peerID, displayName: displayName)
 
         // Reject any pending invitation from this peer
         if let mcPeerID = pendingInvitations.keys.first(where: { $0.displayName == peerID }) {
             pendingInvitations[mcPeerID]?(false, nil)
             pendingInvitations.removeValue(forKey: mcPeerID)
         }
+    }
+
+    // MARK: - Kick / Removal
+
+    /// Remove (kick) a peer from the pool. Host-facing entry point.
+    ///
+    /// Does NOT add the peer to the block list — a kicked (but not blocked) peer may
+    /// legitimately re-join later, at which point the enforcement entry is cleared.
+    /// Use `blockDevice(_:displayName:)` to kick *and* durably block.
+    public func kickPeer(peerID: String, displayName: String) {
+        performRemoval(peerID: peerID, displayName: displayName)
+    }
+
+    /// Shared removal logic for both kick and block.
+    ///
+    /// 1. Sends the cooperative `.removedFromPool` control signal to the target so a
+    ///    well-behaved client leaves on its own (works on both transports).
+    /// 2. For remote pools, asks the relay to kick the peer server-side
+    ///    (`disconnectPeer`) — the relay drops them and replies `403 not_approved`.
+    /// 3. Adds the peer to `removedPeerIDs` so the host enforces the removal against a
+    ///    non-cooperative peer whose MC link lingers (drop-inbound + exclude-outbound).
+    /// 4. Drops the peer from the local roster (MC or remote).
+    ///
+    /// Order matters: the cooperative signal is sent *before* the server kick so it
+    /// reaches the target before the relay tears their connection down.
+    private func performRemoval(peerID: String, displayName: String) {
+        guard !peerID.isEmpty else { return }
+
+        // 1. Cooperative removed-signal (targeted send — not subject to the
+        //    removedPeerIDs exclusion, so it still reaches the target).
+        let signal = PoolMessage.systemEvent(
+            from: localPeerID,
+            senderName: localProfile.displayName,
+            event: .removedFromPool,
+            targetPeerID: peerID,
+            text: "You have been removed from the pool."
+        )
+        sendMessage(signal, to: [peerID])
+
+        // 2. Remote (WebSocket) server-side kick.
+        remoteTransport?.disconnectPeer(peerID)
+
+        // 3. Host-side enforcement for a non-cooperative / lingering MC peer.
+        removedPeerIDs.insert(peerID)
+
+        // 4. Drop from the local roster (covers both MC and remote peers).
+        if let mcPeerID = self.peerIDMap.first(where: { $0.value == peerID })?.key {
+            session?.cancelConnectPeer(mcPeerID)  // cancels an in-flight attempt, if any
+            removeConnectedPeer(mcPeerID)
+        } else {
+            removeRemotePeer(peerID)
+        }
+
+        log("Removed peer from pool: \(displayName) [\(peerID.prefix(8))...]", category: .network)
     }
 
     /// Unblock a device
@@ -1326,6 +1398,11 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     private func addConnectedPeer(_ mcPeerID: MCPeerID) {
         let peerIDString = mcPeerID.displayName
         peerIDMap[mcPeerID] = peerIDString
+
+        // A peer that legitimately (re)connects is no longer under removal enforcement.
+        // (A *blocked* peer never reaches here — the invitation is rejected by the block
+        // list first — so clearing here only affects previously-kicked, allowed rejoiners.)
+        removedPeerIDs.remove(peerIDString)
 
         // Record connection time for DTLS stabilization tracking
         peerConnectionTimes[peerIDString] = Date()
@@ -1476,11 +1553,18 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         return elapsed >= Self.dtlsStabilizationDelay
     }
 
-    /// Get list of peers with stable DTLS connections
+    /// Get list of peers with stable DTLS connections.
+    ///
+    /// ENFORCEMENT: Removed (kicked/blocked) peers are excluded here so that every
+    /// broadcast and host-relay forward that funnels through this method skips them —
+    /// the host never sends pool traffic TO a removed peer. Targeted `sendMessage(_:to:)`
+    /// deliberately does not use this method, so the cooperative removed-signal can still
+    /// be delivered to the target.
     private func peersWithStableDTLS() -> [MCPeerID] {
         guard let session = session else { return [] }
         return session.connectedPeers.filter { mcPeer in
             let peerID = peerIDMap[mcPeer] ?? mcPeer.displayName
+            guard !removedPeerIDs.contains(peerID) else { return false }
             return isDTLSStable(for: peerID)
         }
     }
@@ -1496,11 +1580,15 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         return elapsed >= Self.dtlsStabilizationDelay
     }
 
-    /// Get list of relay peers with stable DTLS connections
+    /// Get list of relay peers with stable DTLS connections.
+    ///
+    /// ENFORCEMENT: Excludes removed (kicked/blocked) peers so relay-session broadcasts
+    /// and the primary→relay bridge never forward pool traffic to a removed relay peer.
     private func relayPeersWithStableDTLS() -> [MCPeerID] {
         guard let relaySession = relaySession else { return [] }
         return relaySession.connectedPeers.filter { mcPeer in
             let peerID = relayPeerIDMap[mcPeer] ?? mcPeer.displayName
+            guard !removedPeerIDs.contains(peerID) else { return false }
             return isRelayDTLSStable(for: peerID)
         }
     }
@@ -1599,6 +1687,13 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         }
 
         log("[RELAY_SESSION] Received \(message.type.rawValue) from relay peer: \(peerDisplayName)", category: .network)
+
+        // ENFORCEMENT: Drop inbound traffic from a removed peer on the relay session too.
+        let inboundRelayPeerID = relayPeerIDMap[mcPeerID] ?? peerDisplayName
+        if removedPeerIDs.contains(inboundRelayPeerID) {
+            log("[KICK_ENFORCE] Dropping inbound relay \(message.type.rawValue) from removed peer \(peerDisplayName)", level: .warning, category: .network)
+            return
+        }
 
         // Route relay envelopes to the mesh relay service for multi-hop processing
         if message.type == .relay {
@@ -1945,6 +2040,15 @@ extension ConnectionPoolManager: MCSessionDelegate {
         Task { @MainActor in
             let receiveTime = Date()
             log("[RECV_TRACE] Received message type=\(message.type.rawValue) from \(peerDisplayName) at \(receiveTime) (epoch: \(String(format: "%.3f", receiveTime.timeIntervalSince1970)))", category: .network)
+
+            // ENFORCEMENT: Drop all inbound traffic from a removed (kicked/blocked) peer
+            // whose MC link has not yet torn down. Nothing is processed or host-relayed,
+            // so a non-cooperative peer is effectively severed from the pool.
+            let inboundPeerID = self.peerIDMap[peerID] ?? peerDisplayName
+            if self.removedPeerIDs.contains(inboundPeerID) {
+                log("[KICK_ENFORCE] Dropping inbound \(message.type.rawValue) from removed peer \(peerDisplayName)", level: .warning, category: .network)
+                return
+            }
 
             // Route relay envelopes to the mesh relay service for multi-hop processing
             if message.type == .relay {

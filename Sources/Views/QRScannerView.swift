@@ -328,12 +328,20 @@ public struct QRScannerView: UIViewRepresentable {
 
         private func showPermissionDeniedMessage() {
             showFallbackLabel(
-                "Camera access denied.\nGo to Settings > Privacy > Camera\nto enable access."
+                poolString(
+                    "connectionpool.scanner.cameraDenied",
+                    fallback: "Camera access denied.\nGo to Settings > Privacy > Camera\nto enable access."
+                )
             )
         }
 
         private func showUnavailableMessage() {
-            showFallbackLabel("Camera is not available on this device.")
+            showFallbackLabel(
+                poolString(
+                    "connectionpool.scanner.cameraUnavailable",
+                    fallback: "Camera is not available on this device."
+                )
+            )
         }
 
         private func showFallbackLabel(_ text: String) {

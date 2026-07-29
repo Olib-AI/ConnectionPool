@@ -37,9 +37,9 @@ public struct PoolUserProfile: Codable, Sendable, Equatable {
         "🌟", "🌈", "🌙", "☀️", "🌸", "🍀", "💎", "🎭"
     ]
 
-    /// Available avatar colors
+    /// Available avatar colors (no purple/indigo per design mandate).
     public static let availableColors: [Color] = [
-        .blue, .green, .orange, .purple, .pink, .cyan, .yellow, .red
+        .blue, .green, .orange, .teal, .pink, .cyan, .yellow, .red
     ]
 
     /// SecureDataStore key for profile

@@ -14,33 +14,6 @@ import AppKit
 
 // MARK: - Cross-Platform Helpers
 
-/// Cross-platform gray background color
-private extension Color {
-    static var systemGray6Color: Color {
-        #if canImport(UIKit)
-        return Color(.systemGray6)
-        #else
-        return Color(nsColor: .controlBackgroundColor)
-        #endif
-    }
-
-    static var systemGray5Color: Color {
-        #if canImport(UIKit)
-        return Color(.systemGray5)
-        #else
-        return Color(nsColor: .separatorColor)
-        #endif
-    }
-
-    static var systemBackgroundColor: Color {
-        #if canImport(UIKit)
-        return Color(.systemBackground)
-        #else
-        return Color(nsColor: .windowBackgroundColor)
-        #endif
-    }
-}
-
 /// Cross-platform clipboard helper
 private enum CrossPlatformClipboard {
     static func copyToClipboard(_ string: String) {
@@ -99,6 +72,9 @@ private extension View {
 /// Main view for the Connection Pool app
 public struct ConnectionPoolView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    // Observe the design store so theme / appearance / language switches re-render
+    // the whole pool UI live (alerts, sheets, and every child screen).
+    @ObservedObject private var design = PoolDesign.shared
 
     public init(viewModel: ConnectionPoolViewModel) {
         self.viewModel = viewModel
@@ -132,8 +108,8 @@ public struct ConnectionPoolView: View {
             .sheet(isPresented: $viewModel.showBlockedDevicesSheet) {
                 BlockedDevicesSheet(viewModel: viewModel)
             }
-            .alert("Error", isPresented: $viewModel.showError) {
-                Button("OK", role: .cancel) {}
+            .alert(poolString("connectionpool.error.title", fallback: "Error"), isPresented: $viewModel.showError) {
+                Button(poolString("common.ok", fallback: "OK"), role: .cancel) {}
             } message: {
                 if let error = viewModel.errorMessage {
                     Text(error)
@@ -158,34 +134,39 @@ public struct ConnectionPoolView: View {
 
 private struct ChatRedirectView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.system(size: 60))
-                .foregroundStyle(.blue)
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(spacing: theme.spacingL) {
+            PoolIcon("comments", size: 60, systemFallback: "bubble.left.and.bubble.right.fill")
+                .foregroundColor(theme.accent)
 
-            Text("Pool Chat")
-                .font(.title.bold())
+            PoolText("connectionpool.chatRedirect.title", fallback: "Pool Chat")
+                .font(theme.fontHeading)
+                .foregroundColor(theme.textPrimary)
 
-            Text("Chat is available as a standalone app.\nOpen Pool Chat from the App Launcher.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            PoolText("connectionpool.chatRedirect.message", fallback: "Chat is available as a standalone app. Open Pool Chat from the App Launcher.")
+                .font(theme.fontBody)
+                .foregroundColor(theme.textSecondary)
                 .multilineTextAlignment(.center)
 
             Button {
                 viewModel.currentView = .lobby
             } label: {
-                Text("Back to Lobby")
-                    .font(.headline)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-                    .background(Color.blue)
-                    .foregroundStyle(.white)
+                PoolText("connectionpool.chatRedirect.backToLobby", fallback: "Back to Lobby")
+                    .font(theme.fontBody.weight(.semibold))
+                    .padding(.horizontal, theme.spacingXL)
+                    .padding(.vertical, theme.spacingM)
+                    .background(theme.accent)
+                    .foregroundColor(theme.textOnAccent)
                     .clipShape(Capsule())
             }
         }
-        .padding()
+        .padding(theme.spacingL)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.background)
     }
 }
 
@@ -193,133 +174,119 @@ private struct ChatRedirectView: View {
 
 private struct HomeView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @State private var showRemoteHostSheet = false
 
     @State private var showDeleteServerAlert = false
 
+    private var theme: PoolThemeSnapshot { design.snapshot(dark: scheme == .dark) }
+
     var body: some View {
         ScrollView {
-            VStack(spacing: 20) {
+            VStack(spacing: theme.spacingXL) {
                 // Profile button in top right
                 HStack {
                     Spacer()
                     ProfileButton(viewModel: viewModel)
                 }
                 .padding(.horizontal)
-                .padding(.top, 8)
+                .padding(.top, theme.spacingS)
 
                 // App Icon & Title
-                VStack(spacing: 12) {
+                VStack(spacing: theme.spacingM) {
                     ZStack {
+                        // Solid accent fill (design mandate: no decorative gradients).
                         Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [.blue, .purple],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
+                            .fill(theme.accent.opacity(0.15))
                             .frame(width: 80, height: 80)
 
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.white)
+                        PoolIcon("tower-broadcast", size: 36, systemFallback: "antenna.radiowaves.left.and.right")
+                            .foregroundColor(theme.accent)
                     }
 
-                    Text("Connection Pool")
-                        .font(.title.bold())
+                    PoolText("connectionpool.home.title", fallback: "Connection Pool")
+                        .font(theme.fontHeading)
+                        .foregroundColor(theme.textPrimary)
 
-                    Text("Connect with nearby devices...")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.home.subtitle", fallback: "Connect with nearby devices to chat, call, and play — no internet required.")
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
                 }
 
                 // Action Buttons
-                VStack(spacing: 16) {
+                VStack(spacing: theme.spacingL) {
                     // Host Pool Button
                     Button {
                         viewModel.currentView = .lobby
                     } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "wifi.circle.fill")
-                                .font(.title2)
+                        HStack(spacing: theme.spacingM) {
+                            PoolIcon("wifi", size: 22, systemFallback: "wifi.circle.fill")
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Host Pool")
-                                    .font(.headline)
-                                Text("Create a new pool for others to join")
-                                    .font(.caption)
-                                    .foregroundStyle(.white.opacity(0.8))
+                                PoolText("connectionpool.home.hostPool", fallback: "Host Pool")
+                                    .font(theme.fontBody.weight(.semibold))
+                                PoolText("connectionpool.home.hostPoolDesc", fallback: "Create a new pool for others to join")
+                                    .font(theme.fontCaption)
+                                    .foregroundColor(theme.textOnAccent.opacity(0.8))
                             }
                             Spacer()
-                            Image(systemName: "chevron.right")
+                            PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
                         }
                         .padding()
                         .frame(maxWidth: .infinity)
-                        .background(
-                            LinearGradient(
-                                colors: [.blue, .blue.opacity(0.8)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .background(theme.accent)
+                        .foregroundStyle(theme.textOnAccent)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     }
 
                     // Join Pool Button
                     Button {
                         viewModel.startBrowsing()
                     } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "magnifyingglass.circle.fill")
-                                .font(.title2)
+                        HStack(spacing: theme.spacingM) {
+                            PoolIcon("magnifying-glass", size: 22, systemFallback: "magnifyingglass.circle.fill")
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Join Pool")
-                                    .font(.headline)
-                                Text("Find and join nearby pools")
-                                    .font(.caption)
-                                    .foregroundStyle(.white.opacity(0.8))
+                                PoolText("connectionpool.home.joinPool", fallback: "Join Pool")
+                                    .font(theme.fontBody.weight(.semibold))
+                                PoolText("connectionpool.home.joinPoolDesc", fallback: "Find and join nearby pools")
+                                    .font(theme.fontCaption)
+                                    .foregroundColor(theme.textOnAccent.opacity(0.8))
                             }
                             Spacer()
-                            Image(systemName: "chevron.right")
+                            PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
                         }
                         .padding()
                         .frame(maxWidth: .infinity)
-                        .background(
-                            LinearGradient(
-                                colors: [.green, .green.opacity(0.8)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .background(theme.success)
+                        .foregroundStyle(theme.textOnAccent)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     }
                 }
                 .padding(.horizontal)
 
                 // Saved Remote Server (if claimed)
                 if let saved = RemotePoolState.load(), saved.isClaimed {
-                    VStack(spacing: 8) {
+                    VStack(spacing: theme.spacingS) {
                         HStack {
                             Button {
                                 viewModel.createRemotePool(serverURL: saved.serverURL)
                             } label: {
                                 HStack {
-                                    Image(systemName: "server.rack")
-                                        .foregroundStyle(.green)
+                                    PoolIcon("server", size: 16, systemFallback: "server.rack")
+                                        .foregroundColor(theme.success)
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(saved.poolName.isEmpty ? "My Server" : saved.poolName)
-                                            .font(.subheadline.bold())
+                                        Text(saved.poolName.isEmpty ? poolString("connectionpool.home.myServer", fallback: "My Server") : saved.poolName)
+                                            .font(theme.fontBody.weight(.semibold))
+                                            .foregroundColor(theme.textPrimary)
                                         Text(saved.serverURL)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
+                                            .font(theme.fontCaption)
+                                            .foregroundColor(theme.textSecondary)
                                             .lineLimit(1)
                                     }
                                     Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .foregroundStyle(.secondary)
+                                    PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
+                                        .foregroundColor(theme.textSecondary)
                                 }
                             }
                             .buttonStyle(.plain)
@@ -327,26 +294,24 @@ private struct HomeView: View {
                             Button {
                                 viewModel.startEditingServerURL(from: saved.serverURL)
                             } label: {
-                                Image(systemName: "pencil")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.blue)
-                                    .padding(8)
+                                PoolIcon("pen", size: 15, systemFallback: "pencil")
+                                    .foregroundColor(theme.accent)
+                                    .padding(theme.spacingS)
                             }
                             .buttonStyle(.plain)
 
                             Button(role: .destructive) {
                                 showDeleteServerAlert = true
                             } label: {
-                                Image(systemName: "trash")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .padding(8)
+                                PoolIcon("trash", size: 15, systemFallback: "trash")
+                                    .foregroundColor(theme.danger)
+                                    .padding(theme.spacingS)
                             }
                             .buttonStyle(.plain)
                         }
                         .padding()
-                        .background(Color.green.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .background(theme.success.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     }
                     .padding(.horizontal)
                 }
@@ -360,58 +325,66 @@ private struct HomeView: View {
                 }
 
                 // Remote Pool Section
-                VStack(spacing: 12) {
-                    Text("Remote Pool")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                VStack(spacing: theme.spacingM) {
+                    PoolText("connectionpool.home.remotePool", fallback: "Remote Pool")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
 
-                    VStack(spacing: 10) {
+                    VStack(spacing: theme.spacingS + 2) {
                         Button(action: { showRemoteHostSheet = true }) {
-                            Label("Host Remote Pool", systemImage: "server.rack")
-                                .frame(maxWidth: .infinity)
+                            HStack(spacing: theme.spacingS) {
+                                PoolIcon("server", size: 15, systemFallback: "server.rack")
+                                PoolText("connectionpool.home.hostRemotePool", fallback: "Host Remote Pool")
+                            }
+                            .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
+                        .tint(theme.accent)
 
                         Button(action: { viewModel.showRemoteJoinSheet = true }) {
-                            Label("Join via Invitation", systemImage: "link")
-                                .frame(maxWidth: .infinity)
+                            HStack(spacing: theme.spacingS) {
+                                PoolIcon("link", size: 15, systemFallback: "link")
+                                PoolText("connectionpool.home.joinViaInvitation", fallback: "Join via Invitation")
+                            }
+                            .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
+                        .tint(theme.accent)
                     }
                     .padding(.horizontal, 40)
                 }
-                .padding(.top, 4)
+                .padding(.top, theme.spacingXS)
 
                 // Info Section
-                HStack(spacing: 16) {
-                    InfoBadge(icon: "lock.fill", text: "Encrypted")
-                    InfoBadge(icon: "wifi.slash", text: "No Internet")
-                    InfoBadge(icon: "person.3.fill", text: "Up to 8")
+                HStack(spacing: theme.spacingL) {
+                    InfoBadge(icon: "lock", systemFallback: "lock.fill", textKey: "connectionpool.home.badge.encrypted", textFallback: "Encrypted")
+                    InfoBadge(icon: "wifi-slash", systemFallback: "wifi.slash", textKey: "connectionpool.home.badge.noInternet", textFallback: "No Internet")
+                    InfoBadge(icon: "users", systemFallback: "person.3.fill", textKey: "connectionpool.home.badge.upTo8", textFallback: "Up to 8")
                 }
-                .padding(.top, 4)
-                .padding(.bottom, 16)
+                .padding(.top, theme.spacingXS)
+                .padding(.bottom, theme.spacingL)
             }
             .padding()
         }
-        .alert("Remove Server", isPresented: $showDeleteServerAlert) {
-            Button("Remove", role: .destructive) {
+        .alert(poolString("connectionpool.home.removeServerTitle", fallback: "Remove Server"), isPresented: $showDeleteServerAlert) {
+            Button(poolString("connectionpool.home.removeServerButton", fallback: "Remove"), role: .destructive) {
                 RemotePoolState.clear()
             }
-            Button("Cancel", role: .cancel) {}
+            Button(poolString("common.cancel", fallback: "Cancel"), role: .cancel) {}
         } message: {
-            Text("This will remove the saved relay server. You can re-add it later by claiming the server again.")
+            Text(poolString("connectionpool.home.removeServerMessage", fallback: "This will remove the saved relay server. You can re-add it later by claiming the server again."))
         }
-        .alert("Edit Server URL", isPresented: $viewModel.showEditServerURL) {
+        .alert(poolString("connectionpool.home.editServerTitle", fallback: "Edit Server URL"), isPresented: $viewModel.showEditServerURL) {
             TextField("wss://relay.example.com", text: $viewModel.editingServerURL)
                 .crossPlatformTextField()
-            Button("Save") {
+            Button(poolString("common.save", fallback: "Save")) {
                 viewModel.updateServerURL(viewModel.editingServerURL)
             }
-            Button("Cancel", role: .cancel) {
+            Button(poolString("common.cancel", fallback: "Cancel"), role: .cancel) {
                 viewModel.showEditServerURL = false
             }
         } message: {
-            Text("Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect.")
+            Text(poolString("connectionpool.home.editServerMessage", fallback: "Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect."))
         }
         .crossPlatformNavigationBarHidden(true)
         .onAppear {
@@ -427,7 +400,7 @@ private struct HomeView: View {
             if let invitation = viewModel.currentRemoteInvitation {
                 InviteCardShareSheet(viewModel: viewModel, invitation: invitation)
             } else {
-                Text("No invitation available").padding()
+                Text(poolString("connectionpool.common.noInvitation", fallback: "No invitation available")).padding()
             }
         }
     }
@@ -437,19 +410,24 @@ private struct HomeView: View {
 
 private struct InfoBadge: View {
     let icon: String
-    let text: String
+    let systemFallback: String
+    let textKey: String
+    let textFallback: String
+
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.caption2)
-            Text(text)
-                .font(.caption2)
+        let theme = design.snapshot(dark: scheme == .dark)
+        HStack(spacing: theme.spacingXS) {
+            PoolIcon(icon, size: 11, systemFallback: systemFallback)
+            PoolText(textKey, fallback: textFallback)
+                .font(theme.fontCaption)
         }
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.systemGray6Color)
+        .foregroundColor(theme.textSecondary)
+        .padding(.horizontal, theme.spacingS)
+        .padding(.vertical, theme.spacingXS)
+        .background(theme.surfaceSecondary)
         .clipShape(Capsule())
     }
 }
@@ -464,6 +442,9 @@ private struct InfoBadge: View {
 private struct HostOfflinePill: View {
     let offlineSince: Date?
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     /// Shared relative formatter — instantiating `RelativeDateTimeFormatter` is cheap but
     /// repeating it on every body re-render isn't free, so it lives in a static.
     private static let relativeFormatter: RelativeDateTimeFormatter = {
@@ -473,37 +454,38 @@ private struct HostOfflinePill: View {
     }()
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+        let theme = design.snapshot(dark: scheme == .dark)
+        HStack(spacing: theme.spacingS) {
+            PoolIcon("triangle-exclamation", size: 16, systemFallback: "exclamationmark.triangle.fill")
+                .foregroundColor(theme.warning)
             VStack(alignment: .leading, spacing: 2) {
                 Text(headline)
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.orange)
-                Text("New invitations are paused until the host comes back. Existing chat, calls, and tunneling keep working.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.warning)
+                PoolText("connectionpool.hostOffline.message", fallback: "New invitations are paused until the host comes back. Existing chat, calls, and tunneling keep working.")
+                    .font(theme.fontCaption)
+                    .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12))
+        .background(theme.warning.opacity(0.12))
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous)
+                .stroke(theme.warning.opacity(0.35), lineWidth: 1)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
         .accessibilityElement(children: .combine)
     }
 
     private var headline: String {
         if let offlineSince {
             let suffix = Self.relativeFormatter.localizedString(for: offlineSince, relativeTo: Date())
-            return "Host offline · \(suffix)"
+            return poolString("connectionpool.hostOffline.titleSince", fallback: "Host offline · \(suffix)", args: ["time": suffix])
         } else {
-            return "Host offline"
+            return poolString("connectionpool.hostOffline.title", fallback: "Host offline")
         }
     }
 }
@@ -512,22 +494,26 @@ private struct HostOfflinePill: View {
 
 private struct BrowsePoolsView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         VStack(spacing: 0) {
             // Header
             HStack {
                 Button {
                     viewModel.goBack()
                 } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.title3)
+                    PoolIcon("chevron-left", size: 18, systemFallback: "chevron.left")
+                        .foregroundColor(theme.accent)
                 }
 
                 Spacer()
 
-                Text("Nearby Pools")
-                    .font(.headline)
+                PoolText("connectionpool.browse.title", fallback: "Nearby Pools")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
@@ -535,69 +521,68 @@ private struct BrowsePoolsView: View {
                 Button {
                     viewModel.refreshBrowsing()
                 } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.title3)
+                    PoolIcon("arrow-rotate-right", size: 18, systemFallback: "arrow.clockwise")
+                        .foregroundColor(theme.accent)
                 }
             }
             .padding()
-            .background(Color.systemGray6Color)
+            .background(theme.surface)
 
             // Scanning indicator
             if viewModel.poolState == .browsing && viewModel.discoveredPeers.isEmpty {
-                VStack(spacing: 16) {
+                VStack(spacing: theme.spacingL) {
                     Spacer()
 
                     // Animated scanning indicator
                     ZStack {
                         ForEach(0..<3) { index in
                             Circle()
-                                .stroke(Color.blue.opacity(0.3), lineWidth: 2)
+                                .stroke(theme.accent.opacity(0.3), lineWidth: 2)
                                 .frame(width: CGFloat(60 + index * 40), height: CGFloat(60 + index * 40))
                         }
 
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .font(.system(size: 30))
-                            .foregroundStyle(.blue)
+                        PoolIcon("tower-broadcast", size: 30, systemFallback: "antenna.radiowaves.left.and.right")
+                            .foregroundColor(theme.accent)
                     }
 
-                    Text("Scanning for nearby pools...")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.browse.scanning", fallback: "Scanning for nearby pools…")
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
 
-                    Text("Make sure other devices are hosting\na Connection Pool nearby")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.browse.scanningHint", fallback: "Make sure other devices are hosting a Connection Pool nearby")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
 
                     Spacer()
                 }
             } else if viewModel.discoveredPeers.isEmpty {
-                VStack(spacing: 16) {
+                VStack(spacing: theme.spacingL) {
                     Spacer()
 
-                    Image(systemName: "antenna.radiowaves.left.and.right.slash")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
+                    PoolIcon("wifi-slash", size: 48, systemFallback: "antenna.radiowaves.left.and.right.slash")
+                        .foregroundColor(theme.textTertiary)
 
-                    Text("No pools found")
-                        .font(.headline)
+                    PoolText("connectionpool.browse.noneTitle", fallback: "No pools found")
+                        .font(theme.fontHeading)
+                        .foregroundColor(theme.textPrimary)
 
-                    Text("Ask someone to host a pool\nor try again later")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.browse.noneMessage", fallback: "Ask someone to host a pool or try again later")
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
 
                     Button {
                         viewModel.refreshBrowsing()
                     } label: {
-                        HStack {
-                            Image(systemName: "arrow.clockwise")
-                            Text("Scan Again")
+                        HStack(spacing: theme.spacingS) {
+                            PoolIcon("arrow-rotate-right", size: 14, systemFallback: "arrow.clockwise")
+                            PoolText("connectionpool.browse.scanAgain", fallback: "Scan Again")
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(Color.blue)
-                        .foregroundStyle(.white)
+                        .padding(.horizontal, theme.spacingL + 4)
+                        .padding(.vertical, theme.spacingS + 2)
+                        .background(theme.accent)
+                        .foregroundStyle(theme.textOnAccent)
                         .clipShape(Capsule())
                     }
 
@@ -616,6 +601,7 @@ private struct BrowsePoolsView: View {
                 .listStyle(.plain)
             }
         }
+        .background(theme.background)
         .crossPlatformNavigationBarHidden(true)
     }
 }
@@ -626,12 +612,16 @@ private struct DiscoveredPoolRow: View {
     let peer: DiscoveredPeer
     let onJoin: () -> Void
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     private var avatarColor: Color {
         PoolUserProfile.availableColors[peer.avatarColorIndex % PoolUserProfile.availableColors.count]
     }
 
     var body: some View {
-        HStack(spacing: 12) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        HStack(spacing: theme.spacingM) {
             // Host avatar (shows emoji if profile available, otherwise icon)
             ZStack {
                 Circle()
@@ -642,36 +632,41 @@ private struct DiscoveredPoolRow: View {
                     Text(emoji)
                         .font(.system(size: 24))
                 } else {
-                    Image(systemName: "wifi.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(avatarColor)
+                    PoolIcon("wifi", size: 22, systemFallback: "wifi.circle.fill")
+                        .foregroundColor(avatarColor)
                 }
             }
 
             // Pool info
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: theme.spacingXS) {
+                HStack(spacing: theme.spacingXS + 2) {
                     Text(peer.displayName)
-                        .font(.headline)
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
 
                     // Show lock icon if pool requires code
                     if peer.hasPoolCode {
-                        Image(systemName: "lock.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                        PoolIcon("lock", size: 11, systemFallback: "lock.fill")
+                            .foregroundColor(theme.warning)
                     }
                 }
 
-                HStack(spacing: 8) {
+                HStack(spacing: theme.spacingXS + 4) {
                     // Show host name if profile available
                     if let hostName = peer.hostProfile?.displayName {
-                        Label(hostName, systemImage: "person.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: theme.spacingXS) {
+                            PoolIcon("user", size: 11, systemFallback: "person.fill")
+                            Text(hostName)
+                        }
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                     } else {
-                        Label(peer.id, systemImage: "iphone")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: theme.spacingXS) {
+                            PoolIcon("mobile", size: 11, systemFallback: "iphone")
+                            Text(peer.id)
+                        }
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                     }
                 }
             }
@@ -680,28 +675,28 @@ private struct DiscoveredPoolRow: View {
 
             // Join button
             if peer.isInviting {
-                VStack(spacing: 4) {
+                VStack(spacing: theme.spacingXS) {
                     ProgressView()
-                    Text("Joining...")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.browse.joining", fallback: "Joining…")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                 }
             } else {
                 Button {
                     onJoin()
                 } label: {
-                    Text("Join")
-                        .font(.subheadline.bold())
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Color.blue)
-                        .foregroundStyle(.white)
+                    PoolText("connectionpool.browse.join", fallback: "Join")
+                        .font(theme.fontBody.weight(.semibold))
+                        .padding(.horizontal, theme.spacingL)
+                        .padding(.vertical, theme.spacingS)
+                        .background(theme.accent)
+                        .foregroundStyle(theme.textOnAccent)
                         .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, theme.spacingS)
     }
 }
 
@@ -709,8 +704,12 @@ private struct DiscoveredPoolRow: View {
 
 private struct PoolLobbyView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @State private var showHostSettings = false
     @State private var showInviteSheet = false
+
+    private var theme: PoolThemeSnapshot { design.snapshot(dark: scheme == .dark) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -793,20 +792,20 @@ private struct PoolLobbyView: View {
             if let invitation = viewModel.currentRemoteInvitation {
                 InviteCardShareSheet(viewModel: viewModel, invitation: invitation)
             } else {
-                Text("No invitation available").padding()
+                Text(poolString("connectionpool.common.noInvitation", fallback: "No invitation available")).padding()
             }
         }
-        .alert("Edit Server URL", isPresented: $viewModel.showEditServerURL) {
+        .alert(poolString("connectionpool.home.editServerTitle", fallback: "Edit Server URL"), isPresented: $viewModel.showEditServerURL) {
             TextField("wss://relay.example.com", text: $viewModel.editingServerURL)
                 .crossPlatformTextField()
-            Button("Save") {
+            Button(poolString("common.save", fallback: "Save")) {
                 viewModel.updateServerURL(viewModel.editingServerURL)
             }
-            Button("Cancel", role: .cancel) {
+            Button(poolString("common.cancel", fallback: "Cancel"), role: .cancel) {
                 viewModel.showEditServerURL = false
             }
         } message: {
-            Text("Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect.")
+            Text(poolString("connectionpool.home.editServerMessage", fallback: "Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect."))
         }
     }
 
@@ -815,24 +814,25 @@ private struct PoolLobbyView: View {
             Button {
                 viewModel.goBack()
             } label: {
-                Image(systemName: "chevron.left")
-                    .font(.title3)
+                PoolIcon("chevron-left", size: 18, systemFallback: "chevron.left")
+                    .foregroundColor(theme.accent)
             }
 
             Spacer()
 
             VStack(spacing: 2) {
-                HStack(spacing: 6) {
+                HStack(spacing: theme.spacingXS + 2) {
                     Circle()
-                        .fill(headerStatusColor)
+                        .fill(headerStatusColor(theme))
                         .frame(width: 8, height: 8)
                     Text(headerStatusText)
-                        .font(.headline)
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
                 }
                 if let session = viewModel.currentSession {
                     Text(session.name)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                 }
             }
 
@@ -842,17 +842,17 @@ private struct PoolLobbyView: View {
                 Button {
                     showHostSettings = true
                 } label: {
-                    Image(systemName: "gearshape")
-                        .font(.title3)
+                    PoolIcon("gear", size: 18, systemFallback: "gearshape")
+                        .foregroundColor(theme.accent)
                 }
             } else {
-                Image(systemName: "gearshape")
-                    .font(.title3)
+                PoolIcon("gear", size: 18, systemFallback: "gearshape")
+                    .foregroundColor(theme.accent)
                     .opacity(0)
             }
         }
         .padding()
-        .background(Color.systemGray6Color)
+        .background(theme.surface)
     }
 
     /// Whether user is in host setup mode (before starting to host)
@@ -865,44 +865,44 @@ private struct PoolLobbyView: View {
         let state = viewModel.poolState
         switch state {
         case .idle:
-            return "Setup"
+            return poolString("connectionpool.lobby.statusSetup", fallback: "Setup")
         case .hosting:
             let peerCount = viewModel.connectedPeers.count
             // Subtract 1 for host themselves
             let guestCount = max(0, peerCount - 1)
             if guestCount == 0 {
-                return "Hosting - Waiting"
+                return poolString("connectionpool.lobby.statusHostingWaiting", fallback: "Hosting · Waiting")
             } else {
-                return "Hosting"
+                return poolString("connectionpool.lobby.statusHosting", fallback: "Hosting")
             }
         case .browsing:
-            return "Browsing"
+            return poolString("connectionpool.lobby.statusBrowsing", fallback: "Browsing")
         case .connecting:
-            return "Connecting"
+            return poolString("connectionpool.lobby.statusConnecting", fallback: "Connecting")
         case .connected:
-            return "Connected"
+            return poolString("connectionpool.lobby.statusConnected", fallback: "Connected")
         case .error:
-            return "Error"
+            return poolString("connectionpool.lobby.statusError", fallback: "Error")
         }
     }
 
     /// Header status color reflecting the actual connection state
-    private var headerStatusColor: Color {
+    private func headerStatusColor(_ theme: PoolThemeSnapshot) -> Color {
         let state = viewModel.poolState
         switch state {
         case .idle:
-            return .gray
+            return theme.textTertiary
         case .hosting:
             let peerCount = viewModel.connectedPeers.count
             let guestCount = max(0, peerCount - 1)
-            // Yellow/orange when waiting for participants, green when connected
-            return guestCount == 0 ? .orange : .green
+            // Warning tint while waiting for participants, success once connected.
+            return guestCount == 0 ? theme.warning : theme.success
         case .browsing, .connecting:
-            return .orange
+            return theme.warning
         case .connected:
-            return .green
+            return theme.success
         case .error:
-            return .red
+            return theme.danger
         }
     }
 }
@@ -911,23 +911,28 @@ private struct PoolLobbyView: View {
 
 private struct HostSetupView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         ScrollView {
-            VStack(spacing: 20) {
+            VStack(spacing: theme.spacingXL) {
                 // Pool Name
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Pool Name")
-                        .font(.headline)
+                VStack(alignment: .leading, spacing: theme.spacingS) {
+                    PoolText("connectionpool.setup.poolName", fallback: "Pool Name")
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
 
-                    TextField("Enter pool name", text: $viewModel.poolName)
+                    TextField(poolString("connectionpool.setup.poolNamePlaceholder", fallback: "Enter pool name"), text: $viewModel.poolName)
                         .textFieldStyle(.roundedBorder)
                 }
 
                 // Max Peers
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Maximum Participants")
-                        .font(.headline)
+                VStack(alignment: .leading, spacing: theme.spacingS) {
+                    PoolText("connectionpool.setup.maxParticipants", fallback: "Maximum Participants")
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
 
                     Picker("Max Peers", selection: $viewModel.maxPeers) {
                         ForEach(2...8, id: \.self) { count in
@@ -938,41 +943,43 @@ private struct HostSetupView: View {
                 }
 
                 // Options
-                VStack(spacing: 12) {
+                VStack(spacing: theme.spacingM) {
                     Toggle(isOn: $viewModel.requireEncryption) {
                         HStack {
-                            Image(systemName: "lock.fill")
-                                .foregroundStyle(.green)
-                            Text("Require Encryption")
+                            PoolIcon("lock", size: 15, systemFallback: "lock.fill")
+                                .foregroundColor(theme.success)
+                            PoolText("connectionpool.setup.requireEncryption", fallback: "Require Encryption")
+                                .foregroundColor(theme.textPrimary)
                         }
                     }
 
                     Toggle(isOn: $viewModel.autoAcceptPeers) {
                         HStack {
-                            Image(systemName: "person.badge.plus")
-                                .foregroundStyle(.blue)
-                            Text("Auto-accept Join Requests")
+                            PoolIcon("user-plus", size: 15, systemFallback: "person.badge.plus")
+                                .foregroundColor(theme.accent)
+                            PoolText("connectionpool.setup.autoAccept", fallback: "Auto-accept Join Requests")
+                                .foregroundColor(theme.textPrimary)
                         }
                     }
                 }
                 .padding()
-                .background(Color.systemGray6Color)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .background(theme.surface)
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
 
                 // Start Hosting Button
                 Button {
                     viewModel.startHosting()
                 } label: {
-                    HStack {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                        Text("Start Hosting")
+                    HStack(spacing: theme.spacingS) {
+                        PoolIcon("tower-broadcast", size: 16, systemFallback: "antenna.radiowaves.left.and.right")
+                        PoolText("connectionpool.setup.startHosting", fallback: "Start Hosting")
                     }
-                    .font(.headline)
+                    .font(theme.fontBody.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(Color.blue)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .background(theme.accent)
+                    .foregroundStyle(theme.textOnAccent)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 }
             }
             .padding()
@@ -986,16 +993,20 @@ private struct PoolCodeCard: View {
     let code: String
     @State private var copied = false
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
-        VStack(spacing: 12) {
-            Text("Share this code to invite others")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(spacing: theme.spacingM) {
+            PoolText("connectionpool.code.share", fallback: "Share this code to invite others")
+                .font(theme.fontCaption)
+                .foregroundColor(theme.textSecondary)
 
             Text(code)
                 .font(.system(size: 36, weight: .bold, design: .monospaced))
                 .tracking(6)
-                .foregroundStyle(.primary)
+                .foregroundColor(theme.textPrimary)
 
             Button {
                 CrossPlatformClipboard.copyToClipboard(code)
@@ -1004,22 +1015,24 @@ private struct PoolCodeCard: View {
                     copied = false
                 }
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                    Text(copied ? "Copied!" : "Copy Code")
+                HStack(spacing: theme.spacingXS + 2) {
+                    PoolIcon(copied ? "check" : "copy", size: 14, systemFallback: copied ? "checkmark" : "doc.on.doc")
+                    Text(copied
+                         ? poolString("connectionpool.code.copied", fallback: "Copied!")
+                         : poolString("connectionpool.code.copy", fallback: "Copy Code"))
                 }
-                .font(.subheadline.bold())
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(copied ? Color.green : Color.blue)
-                .foregroundStyle(.white)
+                .font(theme.fontBody.weight(.semibold))
+                .padding(.horizontal, theme.spacingL)
+                .padding(.vertical, theme.spacingS)
+                .background(copied ? theme.success : theme.accent)
+                .foregroundStyle(theme.textOnAccent)
                 .clipShape(Capsule())
             }
         }
         .frame(maxWidth: .infinity)
         .padding()
-        .background(Color.systemGray6Color)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
 
@@ -1027,53 +1040,57 @@ private struct PoolCodeCard: View {
 
 private struct ServerURLCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: theme.spacingS) {
             HStack {
-                Image(systemName: "server.rack")
-                    .foregroundStyle(.blue)
-                Text("Relay Server")
-                    .font(.subheadline.bold())
+                PoolIcon("server", size: 15, systemFallback: "server.rack")
+                    .foregroundColor(theme.accent)
+                PoolText("connectionpool.server.relayServer", fallback: "Relay Server")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
                 Spacer()
                 Button {
                     viewModel.startEditingServerURL()
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "pencil")
-                        Text("Edit")
+                    HStack(spacing: theme.spacingXS) {
+                        PoolIcon("pen", size: 11, systemFallback: "pencil")
+                        PoolText("connectionpool.server.edit", fallback: "Edit")
                     }
-                    .font(.caption.bold())
-                    .foregroundStyle(.blue)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.blue.opacity(0.1))
+                    .font(theme.fontCaption.weight(.semibold))
+                    .foregroundColor(theme.accent)
+                    .padding(.horizontal, theme.spacingS + 2)
+                    .padding(.vertical, theme.spacingXS + 1)
+                    .background(theme.accent.opacity(0.1))
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
 
             Text(viewModel.serverURL)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(theme.fontCaption)
+                .foregroundColor(theme.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
 
             if let confirmation = viewModel.serverURLUpdateConfirmation {
-                HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                HStack(spacing: theme.spacingXS) {
+                    PoolIcon("circle-check", size: 12, systemFallback: "checkmark.circle.fill")
+                        .foregroundColor(theme.success)
                     Text(confirmation)
-                        .foregroundStyle(.green)
+                        .foregroundColor(theme.success)
                 }
-                .font(.caption)
+                .font(theme.fontCaption)
                 .transition(.opacity)
             }
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.systemGray6Color)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
         .animation(.easeInOut(duration: 0.3), value: viewModel.serverURLUpdateConfirmation)
     }
 }
@@ -1088,14 +1105,18 @@ private struct ServerURLCard: View {
 /// approval gate; the relay's server-side `tunnel.enabled` flag must also be on.
 private struct TunnelExitHostCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: viewModel.hostTunnelExitEnabled ? "shield.checkerboard" : "shield.lefthalf.filled")
-                    .foregroundStyle(viewModel.hostTunnelExitEnabled ? Color.green : Color.accentColor)
-                Text("Allow Members to Use Relay Exit")
-                    .font(.headline)
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: theme.spacingM) {
+            HStack(spacing: theme.spacingS) {
+                PoolIcon("shield-halved", size: 16, systemFallback: viewModel.hostTunnelExitEnabled ? "shield.checkerboard" : "shield.lefthalf.filled")
+                    .foregroundColor(viewModel.hostTunnelExitEnabled ? theme.success : theme.accent)
+                PoolText("connectionpool.tunnelExit.title", fallback: "Allow Members to Use Relay Exit")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
                 Spacer()
                 Toggle("", isOn: Binding(
                     get: { viewModel.hostTunnelExitEnabled },
@@ -1104,21 +1125,22 @@ private struct TunnelExitHostCard: View {
                     }
                 ))
                 .labelsHidden()
+                .tint(theme.accent)
             }
 
             if viewModel.hostTunnelExitEnabled {
-                Text("Members of this pool can route their browser traffic through the relay server's internet connection. The relay's IP becomes the exit address — your phone is not in the data path.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                PoolText("connectionpool.tunnelExit.onDesc", fallback: "Members of this pool can route their browser traffic through the relay server's internet connection. The relay's IP becomes the exit address — your phone is not in the data path.")
+                    .font(theme.fontCaption)
+                    .foregroundColor(theme.textSecondary)
             } else {
-                Text("When enabled, members of this pool can route their browser traffic through the relay's internet connection. The relay must also have tunnel-exit turned on in its server config for this to take effect.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                PoolText("connectionpool.tunnelExit.offDesc", fallback: "When enabled, members of this pool can route their browser traffic through the relay's internet connection. The relay must also have tunnel-exit turned on in its server config for this to take effect.")
+                    .font(theme.fontCaption)
+                    .foregroundColor(theme.textSecondary)
             }
         }
         .padding()
-        .background(Color.gray.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.surfaceSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
 
@@ -1131,103 +1153,113 @@ private struct TunnelExitHostCard: View {
 /// of a `Core` dependency.
 private struct RelayTunnelCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: viewModel.memberRelayActive ? "shield.checkerboard" : "shield.lefthalf.filled")
-                    .foregroundStyle(viewModel.memberRelayActive ? Color.green : Color.accentColor)
-                Text("Tunnel Through Host")
-                    .font(.headline)
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: theme.spacingM) {
+            HStack(spacing: theme.spacingS) {
+                PoolIcon("shield-halved", size: 16, systemFallback: viewModel.memberRelayActive ? "shield.checkerboard" : "shield.lefthalf.filled")
+                    .foregroundColor(viewModel.memberRelayActive ? theme.success : theme.accent)
+                PoolText("connectionpool.relayTunnel.title", fallback: "Tunnel Through Host")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
                 Spacer()
             }
 
             if viewModel.memberRelayActive {
                 if let name = viewModel.memberRelayHostName {
-                    Text("Tunnelling through \(name)")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    Text(poolString("connectionpool.relayTunnel.through", fallback: "Tunnelling through \(name)", args: ["host": name]))
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                 } else {
-                    Text("Tunnelling active")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.relayTunnel.active", fallback: "Tunnelling active")
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                 }
                 Button(role: .destructive) {
                     Task { await viewModel.onStopMemberRelayMode?() }
                 } label: {
-                    HStack(spacing: 8) {
+                    HStack(spacing: theme.spacingS) {
                         if viewModel.memberRelayPending {
                             ProgressView().controlSize(.small)
-                            Text("Disconnecting…")
+                            PoolText("connectionpool.relayTunnel.disconnecting", fallback: "Disconnecting…")
                         } else {
-                            Text("Stop Tunnelling")
+                            PoolText("connectionpool.relayTunnel.stop", fallback: "Stop Tunnelling")
                         }
                     }
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .tint(theme.danger)
                 .disabled(viewModel.memberRelayPending)
             } else {
-                Text("Route your browser traffic through the relay server. Useful when you want a different exit IP than your home network.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                PoolText("connectionpool.relayTunnel.desc", fallback: "Route your browser traffic through the relay server. Useful when you want a different exit IP than your home network.")
+                    .font(theme.fontCaption)
+                    .foregroundColor(theme.textSecondary)
                 Button {
                     Task { await viewModel.onStartMemberRelayMode?() }
                 } label: {
-                    HStack(spacing: 8) {
+                    HStack(spacing: theme.spacingS) {
                         if viewModel.memberRelayPending {
-                            ProgressView().controlSize(.small).tint(.white)
-                            Text("Connecting to relay…")
+                            ProgressView().controlSize(.small).tint(theme.textOnAccent)
+                            PoolText("connectionpool.relayTunnel.connecting", fallback: "Connecting to relay…")
                         } else {
-                            Text("Tunnel My Traffic Through Relay")
+                            PoolText("connectionpool.relayTunnel.start", fallback: "Tunnel My Traffic Through Relay")
                         }
                     }
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(theme.accent)
                 .disabled(viewModel.memberRelayPending)
             }
         }
         .padding()
-        .background(Color.gray.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.surfaceSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
 
 private struct ConnectionStatusCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         HStack {
             // Status indicator
-            HStack(spacing: 8) {
+            HStack(spacing: theme.spacingS) {
                 Circle()
-                    .fill(statusColor)
+                    .fill(statusColor(theme))
                     .frame(width: 10, height: 10)
 
                 Text(statusText)
-                    .font(.subheadline)
+                    .font(theme.fontBody)
+                    .foregroundColor(theme.textPrimary)
             }
 
             Spacer()
 
             // Encryption badge
             if viewModel.currentSession?.isEncrypted == true {
-                HStack(spacing: 4) {
-                    Image(systemName: "lock.fill")
-                    Text("Encrypted")
+                HStack(spacing: theme.spacingXS) {
+                    PoolIcon("lock", size: 11, systemFallback: "lock.fill")
+                    PoolText("connectionpool.home.badge.encrypted", fallback: "Encrypted")
                 }
-                .font(.caption)
-                .foregroundStyle(.green)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.green.opacity(0.15))
+                .font(theme.fontCaption)
+                .foregroundColor(theme.success)
+                .padding(.horizontal, theme.spacingS + 2)
+                .padding(.vertical, theme.spacingXS + 1)
+                .background(theme.success.opacity(0.15))
                 .clipShape(Capsule())
             }
         }
         .padding()
-        .background(Color.systemGray6Color)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 
     /// Number of connected guests (peers excluding the host)
@@ -1242,37 +1274,40 @@ private struct ConnectionStatusCard: View {
         let state = viewModel.poolState
         switch state {
         case .idle:
-            return "Not Connected"
+            return poolString("connectionpool.status.notConnected", fallback: "Not Connected")
         case .hosting:
             if guestCount == 0 {
-                return "Hosting - Waiting for participants"
+                return poolString("connectionpool.status.hostingWaiting", fallback: "Hosting · Waiting for participants")
             } else {
-                return "Hosting - \(guestCount) participant\(guestCount == 1 ? "" : "s")"
+                let word = guestCount == 1
+                    ? poolString("connectionpool.status.participant", fallback: "participant")
+                    : poolString("connectionpool.status.participants", fallback: "participants")
+                return poolString("connectionpool.status.hostingCount", fallback: "Hosting · \(guestCount) \(word)", args: ["count": "\(guestCount)", "unit": word])
             }
         case .browsing:
-            return "Looking for Pools"
+            return poolString("connectionpool.status.lookingForPools", fallback: "Looking for Pools")
         case .connecting:
-            return "Connecting..."
+            return poolString("connectionpool.status.connecting", fallback: "Connecting…")
         case .connected:
-            return "Connected"
+            return poolString("connectionpool.status.connected", fallback: "Connected")
         case .error(let message):
-            return "Error: \(message)"
+            return poolString("connectionpool.status.error", fallback: "Error: \(message)", args: ["message": message])
         }
     }
 
-    private var statusColor: Color {
+    private func statusColor(_ theme: PoolThemeSnapshot) -> Color {
         switch viewModel.poolState {
         case .hosting:
-            // Orange when waiting for participants, green when connected
-            return guestCount == 0 ? .orange : .green
+            // Warning while waiting for participants, success once connected.
+            return guestCount == 0 ? theme.warning : theme.success
         case .connected:
-            return .green
+            return theme.success
         case .connecting, .browsing:
-            return .orange
+            return theme.warning
         case .idle:
-            return .gray
+            return theme.textTertiary
         case .error:
-            return .red
+            return theme.danger
         }
     }
 }
@@ -1281,92 +1316,94 @@ private struct ConnectionStatusCard: View {
 
 private struct PendingInvitationsCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: theme.spacingM) {
             HStack {
-                Image(systemName: "person.badge.clock")
-                    .foregroundStyle(.orange)
-                Text("Pending Requests")
-                    .font(.headline)
+                PoolIcon("user-clock", size: 16, systemFallback: "person.badge.clock")
+                    .foregroundColor(theme.warning)
+                PoolText("connectionpool.pending.title", fallback: "Pending Requests")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
                 Text("\(viewModel.pendingInvitations.count)")
-                    .font(.caption.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.orange)
+                    .font(theme.fontCaption.weight(.bold))
+                    .foregroundColor(theme.textOnAccent)
+                    .padding(.horizontal, theme.spacingS)
+                    .padding(.vertical, theme.spacingXS)
+                    .background(theme.warning)
                     .clipShape(Capsule())
             }
 
             ForEach(viewModel.pendingInvitations) { invitation in
-                HStack(spacing: 12) {
+                HStack(spacing: theme.spacingM) {
                     // Avatar
                     ZStack {
                         Circle()
-                            .fill(Color.orange.opacity(0.2))
+                            .fill(theme.warning.opacity(0.2))
                             .frame(width: 40, height: 40)
 
                         Text(String(invitation.displayName.prefix(1)).uppercased())
-                            .font(.headline)
-                            .foregroundStyle(.orange)
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.warning)
                     }
 
                     // Name
                     VStack(alignment: .leading, spacing: 2) {
                         Text(invitation.displayName)
-                            .font(.subheadline.bold())
-                        Text("Wants to join")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.textPrimary)
+                        PoolText("connectionpool.pending.wantsToJoin", fallback: "Wants to join")
+                            .font(theme.fontCaption)
+                            .foregroundColor(theme.textSecondary)
                     }
 
                     Spacer()
 
                     // Block/Reject/Accept buttons
-                    HStack(spacing: 8) {
+                    HStack(spacing: theme.spacingS) {
                         Button {
                             viewModel.blockPendingPeer(invitation)
                         } label: {
-                            Image(systemName: "hand.raised.fill")
-                                .font(.subheadline.bold())
-                                .foregroundStyle(.white)
+                            PoolIcon("hand", size: 14, systemFallback: "hand.raised.fill")
+                                .foregroundColor(theme.textOnAccent)
                                 .frame(width: 32, height: 32)
-                                .background(Color.orange)
+                                .background(theme.warning)
                                 .clipShape(Circle())
                         }
 
                         Button {
                             viewModel.rejectInvitation(invitation)
                         } label: {
-                            Image(systemName: "xmark")
-                                .font(.subheadline.bold())
-                                .foregroundStyle(.white)
+                            PoolIcon("xmark", size: 14, systemFallback: "xmark")
+                                .foregroundColor(theme.textOnAccent)
                                 .frame(width: 32, height: 32)
-                                .background(Color.red)
+                                .background(theme.danger)
                                 .clipShape(Circle())
                         }
 
                         Button {
                             viewModel.acceptInvitation(invitation)
                         } label: {
-                            Image(systemName: "checkmark")
-                                .font(.subheadline.bold())
-                                .foregroundStyle(.white)
+                            PoolIcon("check", size: 14, systemFallback: "checkmark")
+                                .foregroundColor(theme.textOnAccent)
                                 .frame(width: 32, height: 32)
-                                .background(Color.green)
+                                .background(theme.success)
                                 .clipShape(Circle())
                         }
                     }
                 }
-                .padding(.vertical, 4)
+                .padding(.vertical, theme.spacingXS)
             }
         }
         .padding()
-        .background(Color.orange.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.warning.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
 
@@ -1374,41 +1411,43 @@ private struct PendingInvitationsCard: View {
 
 private struct ParticipantsCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
-    private let avatarColors: [Color] = [
-        .red, .orange, .yellow, .green,
-        .blue, .purple, .pink, .cyan
-    ]
+    // Stable per-peer avatar identity palette (no purple/indigo). Identity colors,
+    // not chrome — indexed by the peer's persisted avatar index.
+    private let avatarColors: [Color] = PoolUserProfile.availableColors
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: theme.spacingM) {
             HStack {
-                Text("Participants")
-                    .font(.headline)
+                PoolText("connectionpool.participants.title", fallback: "Participants")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
                 Text("\(viewModel.connectedPeers.count)/\(viewModel.currentSession?.maxPeers ?? 8)")
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.systemGray5Color)
+                    .font(theme.fontCaption.weight(.bold))
+                    .foregroundColor(theme.textSecondary)
+                    .padding(.horizontal, theme.spacingS)
+                    .padding(.vertical, theme.spacingXS)
+                    .background(theme.surfaceSecondary)
                     .clipShape(Capsule())
             }
 
             if viewModel.connectedPeers.isEmpty {
                 HStack {
                     Spacer()
-                    VStack(spacing: 8) {
-                        Image(systemName: "person.slash")
-                            .font(.title)
-                            .foregroundStyle(.secondary)
-                        Text("No participants yet")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                    VStack(spacing: theme.spacingS) {
+                        PoolIcon("user-slash", size: 28, systemFallback: "person.slash")
+                            .foregroundColor(theme.textTertiary)
+                        PoolText("connectionpool.participants.none", fallback: "No participants yet")
+                            .font(theme.fontBody)
+                            .foregroundColor(theme.textSecondary)
                     }
-                    .padding(.vertical, 20)
+                    .padding(.vertical, theme.spacingL + 4)
                     Spacer()
                 }
             } else {
@@ -1426,8 +1465,8 @@ private struct ParticipantsCard: View {
             }
         }
         .padding()
-        .background(Color.systemGray6Color)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
 
@@ -1450,12 +1489,37 @@ private struct ParticipantRow: View {
         peer.isHost && !hostOnline
     }
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     private var avatarColor: Color {
         avatarColors[peer.avatarColorIndex % avatarColors.count]
     }
 
+    /// FA status icon (name, SF-Symbol fallback) for the peer's connection state.
+    private var statusIcon: (String, String) {
+        if hostShownAsOffline { return ("wifi-slash", "wifi.slash") }
+        switch peer.status {
+        case .connecting: return ("circle-notch", "circle.dotted")
+        case .connected: return ("circle-check", "checkmark.circle.fill")
+        case .disconnected: return ("circle-xmark", "xmark.circle.fill")
+        case .notConnected: return ("circle", "circle")
+        }
+    }
+
+    private var statusText: String {
+        if hostShownAsOffline { return poolString("connectionpool.participants.offline", fallback: "Offline") }
+        switch peer.status {
+        case .connecting: return poolString("connectionpool.status.connecting", fallback: "Connecting…")
+        case .connected: return poolString("connectionpool.status.connected", fallback: "Connected")
+        case .disconnected: return poolString("connectionpool.participants.disconnected", fallback: "Disconnected")
+        case .notConnected: return poolString("connectionpool.status.notConnected", fallback: "Not Connected")
+        }
+    }
+
     var body: some View {
-        HStack(spacing: 12) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        HStack(spacing: theme.spacingM) {
             // Avatar - shows emoji if profile available
             ZStack {
                 Circle()
@@ -1467,48 +1531,48 @@ private struct ParticipantRow: View {
                         .font(.system(size: 20))
                 } else {
                     Text(String(peer.effectiveDisplayName.prefix(1)).uppercased())
-                        .font(.headline)
-                        .foregroundStyle(.white)
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textOnAccent)
                 }
             }
 
             // Name & Status
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
+                HStack(spacing: theme.spacingXS + 2) {
                     Text(peer.effectiveDisplayName)
-                        .font(.subheadline.bold())
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
 
                     if peer.isHost {
-                        Text("HOST")
+                        PoolText("connectionpool.participants.host", fallback: "HOST")
                             .font(.caption2.bold())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 6)
+                            .foregroundColor(theme.textOnAccent)
+                            .padding(.horizontal, theme.spacingXS + 2)
                             .padding(.vertical, 2)
-                            .background(Color.orange)
+                            .background(theme.warning)
                             .clipShape(Capsule())
                     }
 
                     if isLocalPeer {
-                        Text("YOU")
+                        PoolText("connectionpool.participants.you", fallback: "YOU")
                             .font(.caption2.bold())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 6)
+                            .foregroundColor(theme.textOnAccent)
+                            .padding(.horizontal, theme.spacingXS + 2)
                             .padding(.vertical, 2)
-                            .background(Color.blue)
+                            .background(theme.accent)
                             .clipShape(Capsule())
                     }
                 }
 
-                HStack(spacing: 4) {
-                    Image(systemName: hostShownAsOffline ? "wifi.slash" : peer.status.iconName)
-                        .font(.caption2)
-                    Text(hostShownAsOffline ? "Offline" : peer.status.displayText)
-                        .font(.caption)
+                HStack(spacing: theme.spacingXS) {
+                    PoolIcon(statusIcon.0, size: 11, systemFallback: statusIcon.1)
+                    Text(statusText)
+                        .font(theme.fontCaption)
                 }
-                .foregroundStyle(
+                .foregroundColor(
                     hostShownAsOffline
-                        ? Color.secondary
-                        : (peer.status == .connected ? Color.green : Color.secondary)
+                        ? theme.textSecondary
+                        : (peer.status == .connected ? theme.success : theme.textSecondary)
                 )
             }
 
@@ -1519,27 +1583,25 @@ private struct ParticipantRow: View {
                 Button {
                     onBlock()
                 } label: {
-                    Image(systemName: "hand.raised.fill")
-                        .font(.subheadline)
-                        .foregroundStyle(.orange)
-                        .padding(8)
-                        .background(Color.orange.opacity(0.1))
+                    PoolIcon("hand", size: 15, systemFallback: "hand.raised.fill")
+                        .foregroundColor(theme.warning)
+                        .padding(theme.spacingS)
+                        .background(theme.warning.opacity(0.1))
                         .clipShape(Circle())
                 }
 
                 Button {
                     onKick()
                 } label: {
-                    Image(systemName: "person.badge.minus")
-                        .font(.subheadline)
-                        .foregroundStyle(.red)
-                        .padding(8)
-                        .background(Color.red.opacity(0.1))
+                    PoolIcon("user-minus", size: 15, systemFallback: "person.badge.minus")
+                        .foregroundColor(theme.danger)
+                        .padding(theme.spacingS)
+                        .background(theme.danger.opacity(0.1))
                         .clipShape(Circle())
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, theme.spacingXS)
     }
 }
 
@@ -1547,28 +1609,30 @@ private struct ParticipantRow: View {
 
 private struct QuickActionsCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Binding var showInviteSheet: Bool
     @State private var showGamesSheet = false
 
     var body: some View {
-        VStack(spacing: 12) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(spacing: theme.spacingM) {
             // Invite button (for host, local mode)
             if viewModel.isHost && viewModel.transportMode == .local {
                 Button {
                     showInviteSheet = true
                 } label: {
                     HStack {
-                        Image(systemName: "person.badge.plus")
-                            .font(.title3)
-                        Text("Invite Peers")
-                            .font(.headline)
+                        PoolIcon("user-plus", size: 18, systemFallback: "person.badge.plus")
+                        PoolText("connectionpool.actions.invitePeers", fallback: "Invite Peers")
+                            .font(theme.fontBody.weight(.semibold))
                         Spacer()
-                        Image(systemName: "chevron.right")
+                        PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
                     }
                     .padding()
-                    .background(Color.green.opacity(0.1))
-                    .foregroundStyle(.green)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .background(theme.success.opacity(0.1))
+                    .foregroundColor(theme.success)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 }
             }
 
@@ -1585,25 +1649,24 @@ private struct QuickActionsCard: View {
                     viewModel.requestInviteLink()
                 } label: {
                     HStack {
-                        Image(systemName: "link.badge.plus")
-                            .font(.title3)
-                        Text("Invite a Friend")
-                            .font(.headline)
+                        PoolIcon("link", size: 18, systemFallback: "link.badge.plus")
+                        PoolText("connectionpool.actions.inviteFriend", fallback: "Invite a Friend")
+                            .font(theme.fontBody.weight(.semibold))
                         Spacer()
-                        Image(systemName: "chevron.right")
+                        PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
                     }
                     .padding()
-                    .background((inviteDisabled ? Color.gray : Color.green).opacity(0.1))
-                    .foregroundStyle(inviteDisabled ? Color.gray : Color.green)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .background((inviteDisabled ? theme.textTertiary : theme.success).opacity(0.1))
+                    .foregroundColor(inviteDisabled ? theme.textTertiary : theme.success)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 }
                 .disabled(inviteDisabled)
 
                 if inviteDisabled {
-                    Text("Host must be online to issue invitations.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
+                    PoolText("connectionpool.actions.hostMustBeOnline", fallback: "Host must be online to issue invitations.")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.horizontal, theme.spacingXS)
                 }
 
                 // Active invitations list (host only)
@@ -1618,18 +1681,16 @@ private struct QuickActionsCard: View {
                 viewModel.openPoolChat()
             } label: {
                 HStack {
-                    Image(systemName: "bubble.left.and.bubble.right.fill")
-                        .font(.title3)
-                    Text("Open Pool Chat")
-                        .font(.headline)
+                    PoolIcon("comments", size: 18, systemFallback: "bubble.left.and.bubble.right.fill")
+                    PoolText("connectionpool.actions.openChat", fallback: "Open Pool Chat")
+                        .font(theme.fontBody.weight(.semibold))
                     Spacer()
-                    Image(systemName: "arrow.up.forward.app")
-                        .font(.caption)
+                    PoolIcon("arrow-up-right-from-square", size: 12, systemFallback: "arrow.up.forward.app")
                 }
                 .padding()
-                .background(Color.blue.opacity(0.1))
-                .foregroundStyle(.blue)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(theme.accent.opacity(0.1))
+                .foregroundColor(theme.accent)
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
             }
 
             // Games button
@@ -1637,18 +1698,16 @@ private struct QuickActionsCard: View {
                 showGamesSheet = true
             } label: {
                 HStack {
-                    Image(systemName: "gamecontroller.fill")
-                        .font(.title3)
-                    Text("Play Games")
-                        .font(.headline)
+                    PoolIcon("gamepad", size: 18, systemFallback: "gamecontroller.fill")
+                    PoolText("connectionpool.actions.playGames", fallback: "Play Games")
+                        .font(theme.fontBody.weight(.semibold))
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
+                    PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
                 }
                 .padding()
-                .background(Color.purple.opacity(0.1))
-                .foregroundStyle(.purple)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(theme.info.opacity(0.1))
+                .foregroundColor(theme.info)
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
             }
 
             // Blocked Devices button (host only)
@@ -1658,27 +1717,25 @@ private struct QuickActionsCard: View {
                     viewModel.showBlockedDevicesSheet = true
                 } label: {
                     HStack {
-                        Image(systemName: "hand.raised.fill")
-                            .font(.title3)
-                        Text("Blocked Devices")
-                            .font(.headline)
+                        PoolIcon("hand", size: 18, systemFallback: "hand.raised.fill")
+                        PoolText("connectionpool.actions.blockedDevices", fallback: "Blocked Devices")
+                            .font(theme.fontBody.weight(.semibold))
                         Spacer()
                         if !viewModel.blockedDevices.isEmpty {
                             Text("\(viewModel.blockedDevices.count)")
-                                .font(.caption.bold())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.orange)
+                                .font(theme.fontCaption.weight(.bold))
+                                .foregroundColor(theme.textOnAccent)
+                                .padding(.horizontal, theme.spacingS)
+                                .padding(.vertical, theme.spacingXS)
+                                .background(theme.warning)
                                 .clipShape(Capsule())
                         }
-                        Image(systemName: "chevron.right")
-                            .font(.caption)
+                        PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
                     }
                     .padding()
-                    .background(Color.orange.opacity(0.1))
-                    .foregroundStyle(.orange)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .background(theme.warning.opacity(0.1))
+                    .foregroundColor(theme.warning)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 }
             }
 
@@ -1702,6 +1759,8 @@ private struct QuickActionsCard: View {
 /// state so the parent body stays a clean expression tree.
 private struct DisconnectControl: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @State private var showLeaveConfirmation = false
 
     private var isRemoteMember: Bool {
@@ -1709,6 +1768,7 @@ private struct DisconnectControl: View {
     }
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         Button {
             if isRemoteMember {
                 showLeaveConfirmation = true
@@ -1717,24 +1777,25 @@ private struct DisconnectControl: View {
             }
         } label: {
             HStack {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title3)
-                Text(viewModel.isHost ? "Close Pool" : "Leave Pool")
-                    .font(.headline)
+                PoolIcon("circle-xmark", size: 18, systemFallback: "xmark.circle.fill")
+                Text(viewModel.isHost
+                     ? poolString("connectionpool.actions.closePool", fallback: "Close Pool")
+                     : poolString("connectionpool.actions.leavePool", fallback: "Leave Pool"))
+                    .font(theme.fontBody.weight(.semibold))
                 Spacer()
             }
             .padding()
-            .background(Color.red.opacity(0.1))
-            .foregroundStyle(.red)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .background(theme.danger.opacity(0.1))
+            .foregroundColor(theme.danger)
+            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
         }
-        .alert("Leave this pool?", isPresented: $showLeaveConfirmation) {
-            Button("Leave Pool", role: .destructive) {
+        .alert(poolString("connectionpool.leave.title", fallback: "Leave this pool?"), isPresented: $showLeaveConfirmation) {
+            Button(poolString("connectionpool.actions.leavePool", fallback: "Leave Pool"), role: .destructive) {
                 viewModel.leaveRemoteMemberPool()
             }
-            Button("Cancel", role: .cancel) {}
+            Button(poolString("common.cancel", fallback: "Cancel"), role: .cancel) {}
         } message: {
-            Text("You'll need a new invitation to join again.")
+            Text(poolString("connectionpool.leave.message", fallback: "You'll need a new invitation to join again."))
         }
     }
 }
@@ -1743,36 +1804,42 @@ private struct DisconnectControl: View {
 
 private struct GamesSelectionSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
-            VStack(spacing: 20) {
+            VStack(spacing: theme.spacingL + 4) {
                 // Header info
-                VStack(spacing: 8) {
-                    Image(systemName: "gamecontroller.fill")
-                        .font(.system(size: 40))
-                        .foregroundStyle(.purple)
+                VStack(spacing: theme.spacingS) {
+                    PoolIcon("gamepad", size: 40, systemFallback: "gamecontroller.fill")
+                        .foregroundColor(theme.info)
 
-                    Text("Multiplayer Games")
-                        .font(.title2.bold())
+                    PoolText("connectionpool.games.title", fallback: "Multiplayer Games")
+                        .font(theme.fontHeading)
+                        .foregroundColor(theme.textPrimary)
 
-                    Text("Challenge someone in your pool to a game!")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.games.subtitle", fallback: "Challenge someone in your pool to a game!")
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
                 }
                 .padding(.top)
 
                 // Games list
-                VStack(spacing: 12) {
+                VStack(spacing: theme.spacingM) {
                     // Chain Reaction
                     GameSelectionRow(
                         title: "Chain Reaction",
-                        subtitle: "Place orbs and create chain reactions",
-                        icon: "circle.hexagongrid.fill",
+                        subtitleKey: "connectionpool.games.chainReaction.desc",
+                        subtitleFallback: "Place orbs and create chain reactions",
+                        icon: "atom",
+                        systemFallback: "circle.hexagongrid.fill",
                         color: .orange,
-                        players: "2 players"
+                        playersKey: "connectionpool.games.players2",
+                        playersFallback: "2 players"
                     ) {
                         viewModel.openGame(.chainReaction)
                         dismiss()
@@ -1781,10 +1848,13 @@ private struct GamesSelectionSheet: View {
                     // Connect Four
                     GameSelectionRow(
                         title: "Connect Four",
-                        subtitle: "Drop discs to connect 4 in a row",
-                        icon: "circle.grid.3x3.fill",
+                        subtitleKey: "connectionpool.games.connectFour.desc",
+                        subtitleFallback: "Drop discs to connect 4 in a row",
+                        icon: "table-cells",
+                        systemFallback: "circle.grid.3x3.fill",
                         color: .blue,
-                        players: "2 players"
+                        playersKey: "connectionpool.games.players2",
+                        playersFallback: "2 players"
                     ) {
                         viewModel.openGame(.connectFour)
                         dismiss()
@@ -1793,10 +1863,13 @@ private struct GamesSelectionSheet: View {
                     // Chess
                     GameSelectionRow(
                         title: "Chess",
-                        subtitle: "The classic game of strategy",
-                        icon: "crown.fill",
+                        subtitleKey: "connectionpool.games.chess.desc",
+                        subtitleFallback: "The classic game of strategy",
+                        icon: "chess",
+                        systemFallback: "crown.fill",
                         color: .brown,
-                        players: "2 players"
+                        playersKey: "connectionpool.games.players2",
+                        playersFallback: "2 players"
                     ) {
                         viewModel.openGame(.chess)
                         dismiss()
@@ -1805,10 +1878,13 @@ private struct GamesSelectionSheet: View {
                     // Prompt Party
                     GameSelectionRow(
                         title: "Prompt Party",
-                        subtitle: "AI-powered party game with creative prompts",
-                        icon: "bubble.left.and.bubble.right.fill",
+                        subtitleKey: "connectionpool.games.promptParty.desc",
+                        subtitleFallback: "AI-powered party game with creative prompts",
+                        icon: "comments",
+                        systemFallback: "bubble.left.and.bubble.right.fill",
                         color: .pink,
-                        players: "2-8 players"
+                        playersKey: "connectionpool.games.players2to8",
+                        playersFallback: "2-8 players"
                     ) {
                         viewModel.openGame(.promptParty)
                         dismiss()
@@ -1817,10 +1893,13 @@ private struct GamesSelectionSheet: View {
                     // Ludo
                     GameSelectionRow(
                         title: "Ludo",
-                        subtitle: "Classic board game with dice rolling",
-                        icon: "dice.fill",
+                        subtitleKey: "connectionpool.games.ludo.desc",
+                        subtitleFallback: "Classic board game with dice rolling",
+                        icon: "dice",
+                        systemFallback: "dice.fill",
                         color: .green,
-                        players: "2-4 players"
+                        playersKey: "connectionpool.games.players2to4",
+                        playersFallback: "2-4 players"
                     ) {
                         viewModel.openGame(.ludo)
                         dismiss()
@@ -1829,25 +1908,26 @@ private struct GamesSelectionSheet: View {
                 .padding(.horizontal)
 
                 // Note about multiplayer
-                HStack(spacing: 8) {
-                    Image(systemName: "info.circle.fill")
-                        .foregroundStyle(.blue)
-                    Text("Select \"vs Player\" mode in the game to play with pool members")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: theme.spacingS) {
+                    PoolIcon("circle-info", size: 15, systemFallback: "info.circle.fill")
+                        .foregroundColor(theme.accent)
+                    PoolText("connectionpool.games.note", fallback: "Select \"vs Player\" mode in the game to play with pool members")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                 }
                 .padding()
-                .background(Color.blue.opacity(0.1))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(theme.accent.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 .padding(.horizontal)
 
                 Spacer()
             }
-            .navigationTitle("Play Games")
+            .background(theme.background)
+            .navigationTitle(poolString("connectionpool.actions.playGames", fallback: "Play Games"))
             .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") {
+                    Button(poolString("common.close", fallback: "Close")) {
                         dismiss()
                     }
                 }
@@ -1860,54 +1940,58 @@ private struct GamesSelectionSheet: View {
 
 private struct GameSelectionRow: View {
     let title: String
-    let subtitle: String
+    let subtitleKey: String
+    let subtitleFallback: String
     let icon: String
+    let systemFallback: String
     let color: Color
-    let players: String
+    let playersKey: String
+    let playersFallback: String
     let action: () -> Void
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         Button(action: action) {
-            HStack(spacing: 16) {
+            HStack(spacing: theme.spacingL) {
                 // Icon
                 ZStack {
-                    RoundedRectangle(cornerRadius: 12)
+                    RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous)
                         .fill(color.opacity(0.2))
                         .frame(width: 56, height: 56)
 
-                    Image(systemName: icon)
-                        .font(.system(size: 24))
-                        .foregroundStyle(color)
+                    PoolIcon(icon, size: 24, systemFallback: systemFallback)
+                        .foregroundColor(color)
                 }
 
                 // Info
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: theme.spacingXS) {
                     Text(title)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
 
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    PoolText(subtitleKey, fallback: subtitleFallback)
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
 
-                    HStack(spacing: 4) {
-                        Image(systemName: "person.2.fill")
-                            .font(.caption2)
-                        Text(players)
+                    HStack(spacing: theme.spacingXS) {
+                        PoolIcon("users", size: 10, systemFallback: "person.2.fill")
+                        PoolText(playersKey, fallback: playersFallback)
                             .font(.caption2)
                     }
-                    .foregroundStyle(color)
+                    .foregroundColor(color)
                 }
 
                 Spacer()
 
-                Image(systemName: "chevron.right")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                PoolIcon("chevron-right", size: 14, systemFallback: "chevron.right")
+                    .foregroundColor(theme.textSecondary)
             }
             .padding()
-            .background(Color.systemGray6Color)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .background(theme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
         }
         .buttonStyle(.plain)
     }
@@ -1922,30 +2006,30 @@ private struct HostSettingsSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Pool Settings") {
-                    TextField("Pool Name", text: $viewModel.poolName)
+                Section(poolString("connectionpool.settings.poolSettings", fallback: "Pool Settings")) {
+                    TextField(poolString("connectionpool.setup.poolName", fallback: "Pool Name"), text: $viewModel.poolName)
 
-                    Picker("Max Participants", selection: $viewModel.maxPeers) {
+                    Picker(poolString("connectionpool.settings.maxParticipants", fallback: "Max Participants"), selection: $viewModel.maxPeers) {
                         ForEach(2...8, id: \.self) { count in
                             Text("\(count)").tag(count)
                         }
                     }
                 }
 
-                Section("Security") {
-                    Toggle("Require Encryption", isOn: $viewModel.requireEncryption)
-                    Toggle("Auto-accept Join Requests", isOn: $viewModel.autoAcceptPeers)
+                Section(poolString("connectionpool.settings.security", fallback: "Security")) {
+                    Toggle(poolString("connectionpool.setup.requireEncryption", fallback: "Require Encryption"), isOn: $viewModel.requireEncryption)
+                    Toggle(poolString("connectionpool.setup.autoAccept", fallback: "Auto-accept Join Requests"), isOn: $viewModel.autoAcceptPeers)
                 }
 
                 // Note: the relay-exit toggle lives on the main pool detail page in
                 // `TunnelExitHostCard`. The duplicate that used to live here was removed
                 // so there is one canonical entry point.
             }
-            .navigationTitle("Pool Settings")
+            .navigationTitle(poolString("connectionpool.settings.poolSettings", fallback: "Pool Settings"))
             .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
+                    Button(poolString("common.done", fallback: "Done")) {
                         dismiss()
                     }
                 }
@@ -1958,81 +2042,85 @@ private struct HostSettingsSheet: View {
 
 private struct InvitationRequestSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
-            VStack(spacing: 24) {
+            VStack(spacing: theme.spacingXL) {
                 if let invitation = viewModel.currentInvitation {
                     // Invitation icon
                     ZStack {
                         Circle()
-                            .fill(Color.blue.opacity(0.1))
+                            .fill(theme.accent.opacity(0.1))
                             .frame(width: 100, height: 100)
 
-                        Image(systemName: "person.badge.plus")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.blue)
+                        PoolIcon("user-plus", size: 40, systemFallback: "person.badge.plus")
+                            .foregroundColor(theme.accent)
                     }
 
                     // Invitation text
-                    VStack(spacing: 8) {
-                        Text("Join Request")
-                            .font(.title2.bold())
+                    VStack(spacing: theme.spacingS) {
+                        PoolText("connectionpool.joinRequest.title", fallback: "Join Request")
+                            .font(theme.fontHeading)
+                            .foregroundColor(theme.textPrimary)
 
-                        Text("\(invitation.displayName) wants to join your pool")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                        Text(poolString("connectionpool.joinRequest.message", fallback: "\(invitation.displayName) wants to join your pool", args: ["name": invitation.displayName]))
+                            .font(theme.fontBody)
+                            .foregroundColor(theme.textSecondary)
                             .multilineTextAlignment(.center)
                     }
 
                     Spacer()
 
                     // Action buttons
-                    VStack(spacing: 12) {
+                    VStack(spacing: theme.spacingM) {
                         Button {
                             viewModel.acceptInvitation(invitation)
                             dismiss()
                         } label: {
-                            HStack {
-                                Image(systemName: "checkmark")
-                                Text("Accept")
+                            HStack(spacing: theme.spacingS) {
+                                PoolIcon("check", size: 16, systemFallback: "checkmark")
+                                PoolText("connectionpool.joinRequest.accept", fallback: "Accept")
                             }
-                            .font(.headline)
+                            .font(theme.fontBody.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding()
-                            .background(Color.green)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .background(theme.success)
+                            .foregroundStyle(theme.textOnAccent)
+                            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         }
 
                         Button {
                             viewModel.rejectInvitation(invitation)
                             dismiss()
                         } label: {
-                            HStack {
-                                Image(systemName: "xmark")
-                                Text("Decline")
+                            HStack(spacing: theme.spacingS) {
+                                PoolIcon("xmark", size: 16, systemFallback: "xmark")
+                                PoolText("connectionpool.joinRequest.decline", fallback: "Decline")
                             }
-                            .font(.headline)
+                            .font(theme.fontBody.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding()
-                            .background(Color.systemGray5Color)
-                            .foregroundStyle(.primary)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .background(theme.surfaceSecondary)
+                            .foregroundColor(theme.textPrimary)
+                            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         }
                     }
                 } else {
-                    Text("No pending invitation")
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.joinRequest.none", fallback: "No pending invitation")
+                        .foregroundColor(theme.textSecondary)
                 }
             }
             .padding()
+            .background(theme.background)
             .navigationTitle("")
             .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+                    Button(poolString("common.cancel", fallback: "Cancel")) {
                         dismiss()
                     }
                 }
@@ -2053,9 +2141,11 @@ private struct JoinCodeOverlayView: View {
     let onCancel: () -> Void
 
     @FocusState private var isCodeFieldFocused: Bool
+    @ObservedObject private var design = PoolDesign.shared
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
+        let theme = design.snapshot(dark: colorScheme == .dark)
         ZStack {
             // Dimmed background - tapping dismisses
             Color.black.opacity(0.5)
@@ -2065,30 +2155,30 @@ private struct JoinCodeOverlayView: View {
                 }
 
             // Modal card
-            VStack(spacing: 20) {
+            VStack(spacing: theme.spacingXL) {
                 // Lock icon
                 ZStack {
                     Circle()
-                        .fill(Color.orange.opacity(0.15))
+                        .fill(theme.warning.opacity(0.15))
                         .frame(width: 72, height: 72)
 
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(.orange)
+                    PoolIcon("lock", size: 32, systemFallback: "lock.fill")
+                        .foregroundColor(theme.warning)
                 }
 
                 // Title and pool name
-                VStack(spacing: 6) {
-                    Text("Enter Pool Code")
-                        .font(.title3.bold())
+                VStack(spacing: theme.spacingXS + 2) {
+                    PoolText("connectionpool.joinCode.title", fallback: "Enter Pool Code")
+                        .font(theme.fontHeading)
+                        .foregroundColor(theme.textPrimary)
 
-                    Text("to join \"\(peer.displayName)\"")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    Text(poolString("connectionpool.joinCode.toJoin", fallback: "to join \"\(peer.displayName)\"", args: ["name": peer.displayName]))
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                 }
 
                 // Code input field
-                VStack(spacing: 6) {
+                VStack(spacing: theme.spacingXS + 2) {
                     TextField("XXXXXX", text: $codeInput)
                         .font(.system(size: 28, weight: .bold, design: .monospaced))
                         .multilineTextAlignment(.center)
@@ -2097,8 +2187,8 @@ private struct JoinCodeOverlayView: View {
                         .focused($isCodeFieldFocused)
                         .padding(.vertical, 14)
                         .padding(.horizontal, 20)
-                        .background(Color.systemGray6Color)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(theme.surfaceSecondary)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         .onChange(of: codeInput) { _, newValue in
                             // Limit to 6 characters and uppercase
                             let filtered = String(newValue.uppercased().prefix(6))
@@ -2107,50 +2197,49 @@ private struct JoinCodeOverlayView: View {
                             }
                         }
 
-                    Text("Ask the host for the 6-character code")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.joinCode.hint", fallback: "Ask the host for the 6-character code")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                 }
 
                 // Action buttons
-                HStack(spacing: 12) {
+                HStack(spacing: theme.spacingM) {
                     // Cancel button
                     Button {
                         onCancel()
                     } label: {
-                        Text("Cancel")
-                            .font(.subheadline.weight(.medium))
+                        PoolText("common.cancel", fallback: "Cancel")
+                            .font(theme.fontBody.weight(.medium))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 14)
-                            .background(Color.systemGray5Color)
-                            .foregroundStyle(.primary)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .background(theme.surfaceSecondary)
+                            .foregroundColor(theme.textPrimary)
+                            .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     }
 
                     // Join button
                     Button {
                         onJoin()
                     } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark")
-                                .font(.subheadline.weight(.semibold))
-                            Text("Join")
-                                .font(.subheadline.weight(.semibold))
+                        HStack(spacing: theme.spacingXS + 2) {
+                            PoolIcon("check", size: 14, systemFallback: "checkmark")
+                            PoolText("connectionpool.browse.join", fallback: "Join")
                         }
+                        .font(theme.fontBody.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
-                        .background(codeInput.count == 6 ? Color.green : Color.gray)
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(codeInput.count == 6 ? theme.success : theme.textTertiary)
+                        .foregroundStyle(theme.textOnAccent)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     }
                     .disabled(codeInput.count != 6)
                 }
             }
             .padding(24)
             .background(
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(colorScheme == .dark ? Color.systemGray6Color : Color.systemBackgroundColor)
-                    .shadow(color: .black.opacity(0.2), radius: 20, x: 0, y: 10)
+                RoundedRectangle(cornerRadius: theme.radiusLarge, style: .continuous)
+                    .fill(theme.surfaceElevated)
+                    .shadow(color: theme.shadow.opacity(0.2), radius: 20, x: 0, y: 10)
             )
             .padding(.horizontal, 32)
             .onAppear {
@@ -2169,62 +2258,69 @@ private struct JoinCodeOverlayView: View {
 
 private struct InvitePeersSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
-            VStack(spacing: 20) {
+            VStack(spacing: theme.spacingXL) {
                 // Pool Code section
                 if let poolCode = viewModel.currentSession?.poolCode {
-                    VStack(spacing: 12) {
-                        Text("Share this code")
-                            .font(.headline)
+                    VStack(spacing: theme.spacingM) {
+                        PoolText("connectionpool.invite.shareCode", fallback: "Share this code")
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.textPrimary)
 
                         Text(poolCode)
                             .font(.system(size: 40, weight: .bold, design: .monospaced))
                             .tracking(8)
+                            .foregroundColor(theme.textPrimary)
 
                         Button {
                             CrossPlatformClipboard.copyToClipboard(poolCode)
                         } label: {
-                            HStack {
-                                Image(systemName: "doc.on.doc")
-                                Text("Copy Code")
+                            HStack(spacing: theme.spacingXS + 2) {
+                                PoolIcon("copy", size: 14, systemFallback: "doc.on.doc")
+                                PoolText("connectionpool.code.copy", fallback: "Copy Code")
                             }
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
-                            .background(Color.blue)
-                            .foregroundStyle(.white)
+                            .padding(.horizontal, theme.spacingL)
+                            .padding(.vertical, theme.spacingS + 2)
+                            .background(theme.accent)
+                            .foregroundStyle(theme.textOnAccent)
                             .clipShape(Capsule())
                         }
                     }
                     .padding()
                     .frame(maxWidth: .infinity)
-                    .background(Color.systemGray6Color)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .background(theme.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 }
 
                 Divider()
 
                 // Instructions
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("How to invite")
-                        .font(.headline)
+                VStack(alignment: .leading, spacing: theme.spacingL) {
+                    PoolText("connectionpool.invite.howTo", fallback: "How to invite")
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
 
-                    InviteStep(number: 1, text: "Share the pool code with friends")
-                    InviteStep(number: 2, text: "They open Connection Pool on their device")
-                    InviteStep(number: 3, text: "They tap 'Join Pool' and find your pool")
-                    InviteStep(number: 4, text: "Accept their join request")
+                    InviteStep(number: 1, textKey: "connectionpool.invite.step1", textFallback: "Share the pool code with friends")
+                    InviteStep(number: 2, textKey: "connectionpool.invite.step2", textFallback: "They open Connection Pool on their device")
+                    InviteStep(number: 3, textKey: "connectionpool.invite.step3", textFallback: "They tap 'Join Pool' and find your pool")
+                    InviteStep(number: 4, textKey: "connectionpool.invite.step4", textFallback: "Accept their join request")
                 }
 
                 Spacer()
             }
             .padding()
-            .navigationTitle("Invite Peers")
+            .background(theme.background)
+            .navigationTitle(poolString("connectionpool.actions.invitePeers", fallback: "Invite Peers"))
             .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
+                    Button(poolString("common.done", fallback: "Done")) {
                         dismiss()
                     }
                 }
@@ -2237,19 +2333,25 @@ private struct InvitePeersSheet: View {
 
 private struct InviteStep: View {
     let number: Int
-    let text: String
+    let textKey: String
+    let textFallback: String
+
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        HStack(spacing: 12) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        HStack(spacing: theme.spacingM) {
             Text("\(number)")
-                .font(.caption.bold())
-                .foregroundStyle(.white)
+                .font(theme.fontCaption.weight(.bold))
+                .foregroundColor(theme.textOnAccent)
                 .frame(width: 24, height: 24)
-                .background(Color.blue)
+                .background(theme.accent)
                 .clipShape(Circle())
 
-            Text(text)
-                .font(.subheadline)
+            PoolText(textKey, fallback: textFallback)
+                .font(theme.fontBody)
+                .foregroundColor(theme.textPrimary)
         }
     }
 }
@@ -2258,57 +2360,64 @@ private struct InviteStep: View {
 
 private struct BlockedDevicesSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
             Group {
                 if viewModel.blockedDevices.isEmpty {
-                    VStack(spacing: 16) {
+                    VStack(spacing: theme.spacingL) {
                         Spacer()
 
-                        Image(systemName: "hand.raised.slash")
-                            .font(.system(size: 48))
-                            .foregroundStyle(.secondary)
+                        PoolIcon("hand", size: 48, systemFallback: "hand.raised.slash")
+                            .foregroundColor(theme.textTertiary)
 
-                        Text("No Blocked Devices")
-                            .font(.headline)
+                        PoolText("connectionpool.blocked.emptyTitle", fallback: "No Blocked Devices")
+                            .font(theme.fontHeading)
+                            .foregroundColor(theme.textPrimary)
 
-                        Text("Devices that are blocked from joining\nyour pool will appear here.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                        PoolText("connectionpool.blocked.emptyMessage", fallback: "Devices that are blocked from joining your pool will appear here.")
+                            .font(theme.fontBody)
+                            .foregroundColor(theme.textSecondary)
                             .multilineTextAlignment(.center)
 
                         Spacer()
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(theme.background)
                 } else {
                     List {
                         ForEach(viewModel.blockedDevices) { device in
-                            HStack(spacing: 12) {
+                            HStack(spacing: theme.spacingM) {
                                 // Icon
                                 ZStack {
                                     Circle()
-                                        .fill(Color.orange.opacity(0.2))
+                                        .fill(theme.warning.opacity(0.2))
                                         .frame(width: 40, height: 40)
 
-                                    Image(systemName: "hand.raised.fill")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.orange)
+                                    PoolIcon("hand", size: 15, systemFallback: "hand.raised.fill")
+                                        .foregroundColor(theme.warning)
                                 }
 
                                 // Info
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(device.peerDisplayName)
-                                        .font(.subheadline.bold())
+                                        .font(theme.fontBody.weight(.semibold))
+                                        .foregroundColor(theme.textPrimary)
 
-                                    HStack(spacing: 6) {
-                                        Text(device.reason == .bruteForce ? "Auto-blocked" : "Manually blocked")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                                    HStack(spacing: theme.spacingXS + 2) {
+                                        Text(device.reason == .bruteForce
+                                             ? poolString("connectionpool.blocked.auto", fallback: "Auto-blocked")
+                                             : poolString("connectionpool.blocked.manual", fallback: "Manually blocked"))
+                                            .font(theme.fontCaption)
+                                            .foregroundColor(theme.textSecondary)
 
                                         Text(device.blockedAt, style: .relative)
-                                            .font(.caption)
-                                            .foregroundStyle(.tertiary)
+                                            .font(theme.fontCaption)
+                                            .foregroundColor(theme.textTertiary)
                                     }
                                 }
 
@@ -2318,27 +2427,27 @@ private struct BlockedDevicesSheet: View {
                                 Button {
                                     viewModel.unblockDevice(device)
                                 } label: {
-                                    Text("Unblock")
-                                        .font(.caption.bold())
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .background(Color.green)
+                                    PoolText("connectionpool.blocked.unblock", fallback: "Unblock")
+                                        .font(theme.fontCaption.weight(.bold))
+                                        .foregroundColor(theme.textOnAccent)
+                                        .padding(.horizontal, theme.spacingM)
+                                        .padding(.vertical, theme.spacingXS + 2)
+                                        .background(theme.success)
                                         .clipShape(Capsule())
                                 }
                                 .buttonStyle(.plain)
                             }
-                            .padding(.vertical, 4)
+                            .padding(.vertical, theme.spacingXS)
                         }
                     }
                     .listStyle(.plain)
                 }
             }
-            .navigationTitle("Blocked Devices")
+            .navigationTitle(poolString("connectionpool.actions.blockedDevices", fallback: "Blocked Devices"))
             .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
+                    Button(poolString("common.done", fallback: "Done")) {
                         dismiss()
                     }
                 }
@@ -2351,12 +2460,15 @@ private struct BlockedDevicesSheet: View {
 
 private struct ProfileButton: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         Button {
             viewModel.startEditingProfile()
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: theme.spacingS) {
                 // Avatar
                 ZStack {
                     Circle()
@@ -2370,22 +2482,21 @@ private struct ProfileButton: View {
                 // Name
                 VStack(alignment: .leading, spacing: 2) {
                     Text(viewModel.localProfile.displayName)
-                        .font(.subheadline.bold())
-                        .foregroundStyle(.primary)
+                        .font(theme.fontBody.weight(.semibold))
+                        .foregroundColor(theme.textPrimary)
                         .lineLimit(1)
 
-                    Text("Edit Profile")
+                    PoolText("connectionpool.profile.edit", fallback: "Edit Profile")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundColor(theme.textSecondary)
                 }
 
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                PoolIcon("chevron-right", size: 12, systemFallback: "chevron.right")
+                    .foregroundColor(theme.textTertiary)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Color.systemGray6Color)
+            .padding(.horizontal, theme.spacingM)
+            .padding(.vertical, theme.spacingS)
+            .background(theme.surface)
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -2396,16 +2507,19 @@ private struct ProfileButton: View {
 
 private struct ProfileSettingsSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: 8)
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationStack {
             ScrollView {
-                VStack(spacing: 24) {
+                VStack(spacing: theme.spacingXL) {
                     // Avatar Preview
-                    VStack(spacing: 16) {
+                    VStack(spacing: theme.spacingL) {
                         ZStack {
                             Circle()
                                 .fill(PoolUserProfile.availableColors[viewModel.editingProfileColorIndex])
@@ -2416,26 +2530,28 @@ private struct ProfileSettingsSheet: View {
                                 .font(.system(size: 50))
                         }
 
-                        Text("Your Pool Avatar")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        PoolText("connectionpool.profile.avatarLabel", fallback: "Your Pool Avatar")
+                            .font(theme.fontCaption)
+                            .foregroundColor(theme.textSecondary)
                     }
-                    .padding(.top, 20)
+                    .padding(.top, theme.spacingL + 4)
 
                     // Display Name
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Display Name")
-                            .font(.headline)
+                    VStack(alignment: .leading, spacing: theme.spacingS) {
+                        PoolText("connectionpool.profile.displayName", fallback: "Display Name")
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.textPrimary)
 
-                        TextField("Enter your name", text: $viewModel.editingProfileName)
+                        TextField(poolString("connectionpool.profile.namePlaceholder", fallback: "Enter your name"), text: $viewModel.editingProfileName)
                             .textFieldStyle(.roundedBorder)
                     }
                     .padding(.horizontal)
 
                     // Avatar Emoji Picker
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Avatar Emoji")
-                            .font(.headline)
+                    VStack(alignment: .leading, spacing: theme.spacingM) {
+                        PoolText("connectionpool.profile.avatarEmoji", fallback: "Avatar Emoji")
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.textPrimary)
                             .padding(.horizontal)
 
                         LazyVGrid(columns: columns, spacing: 10) {
@@ -2448,11 +2564,11 @@ private struct ProfileSettingsSheet: View {
                                         .frame(width: 44, height: 44)
                                         .background(
                                             Circle()
-                                                .fill(viewModel.editingProfileEmoji == emoji ? Color.blue.opacity(0.2) : Color.clear)
+                                                .fill(viewModel.editingProfileEmoji == emoji ? theme.accent.opacity(0.2) : Color.clear)
                                         )
                                         .overlay(
                                             Circle()
-                                                .strokeBorder(viewModel.editingProfileEmoji == emoji ? Color.blue : Color.clear, lineWidth: 2)
+                                                .strokeBorder(viewModel.editingProfileEmoji == emoji ? theme.accent : Color.clear, lineWidth: 2)
                                         )
                                 }
                                 .buttonStyle(.plain)
@@ -2462,12 +2578,13 @@ private struct ProfileSettingsSheet: View {
                     }
 
                     // Avatar Color Picker
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Avatar Color")
-                            .font(.headline)
+                    VStack(alignment: .leading, spacing: theme.spacingM) {
+                        PoolText("connectionpool.profile.avatarColor", fallback: "Avatar Color")
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.textPrimary)
                             .padding(.horizontal)
 
-                        HStack(spacing: 12) {
+                        HStack(spacing: theme.spacingM) {
                             ForEach(0..<PoolUserProfile.availableColors.count, id: \.self) { index in
                                 Button {
                                     viewModel.editingProfileColorIndex = index
@@ -2477,11 +2594,11 @@ private struct ProfileSettingsSheet: View {
                                         .frame(width: 36, height: 36)
                                         .overlay(
                                             Circle()
-                                                .strokeBorder(Color.white, lineWidth: viewModel.editingProfileColorIndex == index ? 3 : 0)
+                                                .strokeBorder(theme.surface, lineWidth: viewModel.editingProfileColorIndex == index ? 3 : 0)
                                         )
                                         .overlay(
                                             Circle()
-                                                .strokeBorder(Color.primary.opacity(0.3), lineWidth: viewModel.editingProfileColorIndex == index ? 1 : 0)
+                                                .strokeBorder(theme.textPrimary.opacity(0.3), lineWidth: viewModel.editingProfileColorIndex == index ? 1 : 0)
                                         )
                                         .shadow(color: viewModel.editingProfileColorIndex == index ? PoolUserProfile.availableColors[index].opacity(0.5) : Color.clear, radius: 4)
                                 }
@@ -2492,26 +2609,27 @@ private struct ProfileSettingsSheet: View {
                     }
 
                     // Info text
-                    Text("Your profile will be visible to other pool members in chat and games.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.profile.info", fallback: "Your profile will be visible to other pool members in chat and games.")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
 
                     Spacer(minLength: 40)
                 }
             }
-            .navigationTitle("Edit Profile")
+            .background(theme.background)
+            .navigationTitle(poolString("connectionpool.profile.title", fallback: "Edit Profile"))
             .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+                    Button(poolString("common.cancel", fallback: "Cancel")) {
                         viewModel.cancelProfileEditing()
                     }
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
+                    Button(poolString("common.save", fallback: "Save")) {
                         viewModel.saveProfile()
                     }
                     .fontWeight(.semibold)
@@ -2525,77 +2643,83 @@ private struct ProfileSettingsSheet: View {
 
 private struct RemoteHostSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
     @State private var serverURLInput: String = ""
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationView {
             Group {
                 if viewModel.showClaimCodeInput {
                     RemoteHostClaimView(viewModel: viewModel, dismiss: dismiss)
                 } else {
                     ScrollView {
-                        VStack(spacing: 24) {
+                        VStack(spacing: theme.spacingXL) {
                             // Header
-                            VStack(spacing: 12) {
+                            VStack(spacing: theme.spacingM) {
                                 ZStack {
                                     Circle()
-                                        .fill(Color.purple.opacity(0.15))
+                                        .fill(theme.info.opacity(0.15))
                                         .frame(width: 80, height: 80)
 
-                                    Image(systemName: "server.rack")
-                                        .font(.system(size: 36))
-                                        .foregroundStyle(.purple)
+                                    PoolIcon("server", size: 36, systemFallback: "server.rack")
+                                        .foregroundColor(theme.info)
                                 }
 
-                                Text("Host Remote Pool")
-                                    .font(.title2.bold())
+                                PoolText("connectionpool.remoteHost.title", fallback: "Host Remote Pool")
+                                    .font(theme.fontHeading)
+                                    .foregroundColor(theme.textPrimary)
 
-                                Text("Create a pool that anyone can join\nvia invitation link, from anywhere.")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                                PoolText("connectionpool.remoteHost.subtitle", fallback: "Create a pool that anyone can join via invitation link, from anywhere.")
+                                    .font(theme.fontBody)
+                                    .foregroundColor(theme.textSecondary)
                                     .multilineTextAlignment(.center)
                             }
                             .padding(.top)
 
                             // Server URL
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Server URL")
-                                    .font(.headline)
+                            VStack(alignment: .leading, spacing: theme.spacingS) {
+                                PoolText("connectionpool.remoteHost.serverURL", fallback: "Server URL")
+                                    .font(theme.fontBody.weight(.semibold))
+                                    .foregroundColor(theme.textPrimary)
 
                                 TextField("10.0.0.4:9090 or relay.example.com", text: $serverURLInput)
                                     .textFieldStyle(.roundedBorder)
                                     .autocorrectionDisabled()
                                     .crossPlatformTextField()
 
-                                Text("IP:port for local, domain for internet (via cloudflared)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                PoolText("connectionpool.remoteHost.serverURLHint", fallback: "IP:port for local, domain for internet (via cloudflared)")
+                                    .font(theme.fontCaption)
+                                    .foregroundColor(theme.textSecondary)
                             }
 
                             // Pool Name
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Pool Name")
-                                    .font(.headline)
+                            VStack(alignment: .leading, spacing: theme.spacingS) {
+                                PoolText("connectionpool.setup.poolName", fallback: "Pool Name")
+                                    .font(theme.fontBody.weight(.semibold))
+                                    .foregroundColor(theme.textPrimary)
 
-                                TextField("Enter pool name", text: $viewModel.poolName)
+                                TextField(poolString("connectionpool.setup.poolNamePlaceholder", fallback: "Enter pool name"), text: $viewModel.poolName)
                                     .textFieldStyle(.roundedBorder)
                             }
 
                             // Max Members
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Max Members")
-                                    .font(.headline)
+                            VStack(alignment: .leading, spacing: theme.spacingS) {
+                                PoolText("connectionpool.remoteHost.maxMembers", fallback: "Max Members")
+                                    .font(theme.fontBody.weight(.semibold))
+                                    .foregroundColor(theme.textPrimary)
 
-                                Picker("Max Members", selection: $viewModel.maxPeers) {
+                                Picker(poolString("connectionpool.remoteHost.maxMembers", fallback: "Max Members"), selection: $viewModel.maxPeers) {
                                     ForEach([2, 4, 6, 8, 10, 12, 16], id: \.self) { count in
-                                        Text("\(count) members").tag(count)
+                                        Text(poolString("connectionpool.remoteHost.membersCount", fallback: "\(count) members", args: ["count": "\(count)"])).tag(count)
                                     }
                                 }
                                 .pickerStyle(.segmented)
 
-                                Text("Maximum number of peers that can join this pool")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                PoolText("connectionpool.remoteHost.maxMembersHint", fallback: "Maximum number of peers that can join this pool")
+                                    .font(theme.fontCaption)
+                                    .foregroundColor(theme.textSecondary)
                             }
 
                             Spacer(minLength: 20)
@@ -2604,33 +2728,36 @@ private struct RemoteHostSheet: View {
                             Button {
                                 viewModel.createRemotePool(serverURL: serverURLInput)
                             } label: {
-                                HStack {
+                                HStack(spacing: theme.spacingS) {
                                     if viewModel.isConnectingRemote {
                                         ProgressView()
-                                            .tint(.white)
+                                            .tint(theme.textOnAccent)
                                     } else {
-                                        Image(systemName: "antenna.radiowaves.left.and.right")
+                                        PoolIcon("tower-broadcast", size: 16, systemFallback: "antenna.radiowaves.left.and.right")
                                     }
-                                    Text(viewModel.isConnectingRemote ? "Connecting..." : "Create Remote Pool")
+                                    Text(viewModel.isConnectingRemote
+                                         ? poolString("connectionpool.status.connecting", fallback: "Connecting…")
+                                         : poolString("connectionpool.remoteHost.create", fallback: "Create Remote Pool"))
                                 }
-                                .font(.headline)
+                                .font(theme.fontBody.weight(.semibold))
                                 .frame(maxWidth: .infinity)
                                 .padding()
-                                .background(serverURLInput.isEmpty || viewModel.isConnectingRemote ? Color.gray : Color.purple)
-                                .foregroundStyle(.white)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .background(serverURLInput.isEmpty || viewModel.isConnectingRemote ? theme.textTertiary : theme.info)
+                                .foregroundStyle(theme.textOnAccent)
+                                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                             }
                             .disabled(serverURLInput.isEmpty || viewModel.isConnectingRemote)
                         }
                         .padding()
                     }
+                    .background(theme.background)
                     .navigationTitle("")
                     .crossPlatformInlineNavigationTitle()
                 }
             }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+                    Button(poolString("common.cancel", fallback: "Cancel")) {
                         viewModel.showClaimCodeInput = false
                         viewModel.isClaimingServer = false
                         viewModel.serverClaimed = false
@@ -2650,24 +2777,27 @@ private struct RemoteHostSheet: View {
 
 private struct RemoteHostClaimView: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     let dismiss: DismissAction
     @State private var showQRScanner: Bool = false
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         ScrollView {
-            VStack(spacing: 24) {
+            VStack(spacing: theme.spacingXL) {
                 // Header
-                VStack(spacing: 12) {
-                    Image(systemName: "lock.shield")
-                        .font(.system(size: 50))
-                        .foregroundStyle(.orange)
+                VStack(spacing: theme.spacingM) {
+                    PoolIcon("shield-halved", size: 50, systemFallback: "lock.shield")
+                        .foregroundColor(theme.warning)
 
-                    Text("Server Claim Required")
-                        .font(.title2.bold())
+                    PoolText("connectionpool.claim.title", fallback: "Server Claim Required")
+                        .font(theme.fontHeading)
+                        .foregroundColor(theme.textPrimary)
 
-                    Text("Scan the QR code or enter the claim code\nfrom your server's Docker logs.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.claim.subtitle", fallback: "Scan the QR code or enter the claim code from your server's Docker logs.")
+                        .font(theme.fontBody)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
                 }
                 .padding(.top)
@@ -2677,45 +2807,44 @@ private struct RemoteHostClaimView: View {
                 Button {
                     showQRScanner = true
                 } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "qrcode.viewfinder")
-                            .font(.system(size: 24))
+                    HStack(spacing: theme.spacingM) {
+                        PoolIcon("qrcode", size: 24, systemFallback: "qrcode.viewfinder")
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Scan QR Code")
-                                .font(.headline)
-                            Text("Point camera at your server's terminal")
-                                .font(.caption)
-                                .foregroundStyle(.orange.opacity(0.8))
+                            PoolText("connectionpool.claim.scanTitle", fallback: "Scan QR Code")
+                                .font(theme.fontBody.weight(.semibold))
+                            PoolText("connectionpool.claim.scanDesc", fallback: "Point camera at your server's terminal")
+                                .font(theme.fontCaption)
+                                .foregroundColor(theme.warning.opacity(0.8))
                         }
                         Spacer()
-                        Image(systemName: "chevron.right")
-                            .foregroundStyle(.orange.opacity(0.5))
+                        PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
+                            .foregroundColor(theme.warning.opacity(0.5))
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
                 }
-                .background(Color.orange.opacity(0.12))
-                .foregroundStyle(.orange)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .background(theme.warning.opacity(0.12))
+                .foregroundColor(theme.warning)
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusLarge, style: .continuous))
                 .padding(.horizontal)
                 #endif
 
                 // Divider
                 HStack {
                     Rectangle()
-                        .fill(Color.secondary.opacity(0.3))
+                        .fill(theme.separator)
                         .frame(height: 1)
-                    Text("or enter manually")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    PoolText("connectionpool.claim.orManual", fallback: "or enter manually")
+                        .font(theme.fontCaption)
+                        .foregroundColor(theme.textSecondary)
                     Rectangle()
-                        .fill(Color.secondary.opacity(0.3))
+                        .fill(theme.separator)
                         .frame(height: 1)
                 }
                 .padding(.horizontal)
 
                 // Manual Entry
-                VStack(spacing: 16) {
+                VStack(spacing: theme.spacingL) {
                     TextField("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", text: $viewModel.claimCode)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
@@ -2730,40 +2859,41 @@ private struct RemoteHostClaimView: View {
                                 .frame(maxWidth: .infinity)
                                 .padding()
                         } else {
-                            HStack {
-                                Image(systemName: "key.fill")
-                                Text("Claim Server")
+                            HStack(spacing: theme.spacingS) {
+                                PoolIcon("key", size: 16, systemFallback: "key.fill")
+                                PoolText("connectionpool.claim.claimServer", fallback: "Claim Server")
                             }
-                            .font(.headline)
+                            .font(theme.fontBody.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding()
                         }
                     }
-                    .background(viewModel.claimCode.isEmpty || viewModel.isClaimingServer ? Color.gray : Color.orange)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .background(viewModel.claimCode.isEmpty || viewModel.isClaimingServer ? theme.textTertiary : theme.warning)
+                    .foregroundStyle(theme.textOnAccent)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     .disabled(viewModel.claimCode.isEmpty || viewModel.isClaimingServer)
                 }
                 .padding(.horizontal)
 
                 // Server claimed confirmation
                 if viewModel.serverClaimed {
-                    HStack(spacing: 8) {
-                        Image(systemName: "checkmark.seal.fill")
-                            .foregroundStyle(.green)
-                        Text("Server claimed successfully")
-                            .font(.subheadline)
-                            .foregroundStyle(.green)
+                    HStack(spacing: theme.spacingS) {
+                        PoolIcon("badge-check", size: 15, systemFallback: "checkmark.seal.fill")
+                            .foregroundColor(theme.success)
+                        PoolText("connectionpool.claim.success", fallback: "Server claimed successfully")
+                            .font(theme.fontBody)
+                            .foregroundColor(theme.success)
                     }
                     .padding()
                     .frame(maxWidth: .infinity)
-                    .background(Color.green.opacity(0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .background(theme.success.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     .padding(.horizontal)
                 }
             }
         }
-        .navigationTitle("Claim Server")
+        .background(theme.background)
+        .navigationTitle(poolString("connectionpool.claim.navTitle", fallback: "Claim Server"))
         .crossPlatformInlineNavigationTitle()
         .navigationBarBackButtonHidden(viewModel.isClaimingServer)
         .toolbar {
@@ -2792,33 +2922,38 @@ private struct RecoveryKeySheet: View {
     @State private var hasCopied = false
     @State private var isSavingToPasswordManager = false
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     private var hasSaved: Bool {
         hasCopied || viewModel.recoveryKeySavedToPasswordManager
     }
 
     var body: some View {
+        let theme = design.snapshot(dark: scheme == .dark)
         NavigationView {
-            VStack(spacing: 20) {
-                Image(systemName: "key.fill")
-                    .font(.system(size: 50))
-                    .foregroundStyle(.orange)
+            VStack(spacing: theme.spacingXL) {
+                PoolIcon("key", size: 50, systemFallback: "key.fill")
+                    .foregroundColor(theme.warning)
 
-                Text("Save Your Recovery Key")
-                    .font(.title2.bold())
+                PoolText("connectionpool.recovery.title", fallback: "Save Your Recovery Key")
+                    .font(theme.fontHeading)
+                    .foregroundColor(theme.textPrimary)
 
-                Text("This key is the only way to reclaim your server if the binding is lost. It will not be shown again.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                PoolText("connectionpool.recovery.subtitle", fallback: "This key is the only way to reclaim your server if the binding is lost. It will not be shown again.")
+                    .font(theme.fontBody)
+                    .foregroundColor(theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
 
                 if let key = viewModel.serverRecoveryKey {
                     Text(key)
                         .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
                         .padding()
                         .frame(maxWidth: .infinity)
-                        .background(Color.secondary.opacity(0.15))
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(theme.surfaceSecondary)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         .textSelection(.enabled)
                         .padding(.horizontal)
 
@@ -2839,25 +2974,26 @@ private struct RecoveryKeySheet: View {
                                 }
                             }
                         } label: {
-                            HStack {
+                            HStack(spacing: theme.spacingS) {
                                 if isSavingToPasswordManager {
                                     ProgressView()
-                                        .tint(.white)
+                                        .tint(theme.textOnAccent)
                                 } else {
-                                    Image(systemName: viewModel.recoveryKeySavedToPasswordManager
-                                          ? "checkmark.shield.fill" : "lock.shield")
+                                    PoolIcon(viewModel.recoveryKeySavedToPasswordManager ? "shield-check" : "shield-halved",
+                                             size: 16,
+                                             systemFallback: viewModel.recoveryKeySavedToPasswordManager ? "checkmark.shield.fill" : "lock.shield")
                                     Text(viewModel.recoveryKeySavedToPasswordManager
-                                         ? "Saved to Password Manager" : "Save to Password Manager")
+                                         ? poolString("connectionpool.recovery.savedToPM", fallback: "Saved to Password Manager")
+                                         : poolString("connectionpool.recovery.saveToPM", fallback: "Save to Password Manager"))
                                 }
                             }
-                            .font(.headline)
+                            .font(theme.fontBody.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding()
                         }
-                        .background(viewModel.recoveryKeySavedToPasswordManager
-                                    ? Color.green : Color.orange)
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .background(viewModel.recoveryKeySavedToPasswordManager ? theme.success : theme.warning)
+                        .foregroundStyle(theme.textOnAccent)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                         .disabled(isSavingToPasswordManager || viewModel.recoveryKeySavedToPasswordManager)
                         .padding(.horizontal)
                     }
@@ -2869,17 +3005,19 @@ private struct RecoveryKeySheet: View {
                         #endif
                         hasCopied = true
                     } label: {
-                        HStack {
-                            Image(systemName: hasCopied ? "checkmark" : "doc.on.doc")
-                            Text(hasCopied ? "Copied" : "Copy to Clipboard")
+                        HStack(spacing: theme.spacingS) {
+                            PoolIcon(hasCopied ? "check" : "copy", size: 16, systemFallback: hasCopied ? "checkmark" : "doc.on.doc")
+                            Text(hasCopied
+                                 ? poolString("connectionpool.recovery.copied", fallback: "Copied")
+                                 : poolString("connectionpool.recovery.copy", fallback: "Copy to Clipboard"))
                         }
-                        .font(.headline)
+                        .font(theme.fontBody.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding()
                     }
-                    .background(Color.orange.opacity(0.15))
-                    .foregroundStyle(.orange)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .background(theme.warning.opacity(0.15))
+                    .foregroundColor(theme.warning)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                     .padding(.horizontal)
                 }
 
@@ -2888,19 +3026,20 @@ private struct RecoveryKeySheet: View {
                 Button {
                     viewModel.acknowledgeRecoveryKey()
                 } label: {
-                    Text("I've Saved My Recovery Key")
-                        .font(.headline)
+                    PoolText("connectionpool.recovery.acknowledge", fallback: "I've Saved My Recovery Key")
+                        .font(theme.fontBody.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding()
                 }
-                .background(hasSaved ? Color.orange : Color.gray)
-                .foregroundStyle(.white)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .background(hasSaved ? theme.warning : theme.textTertiary)
+                .foregroundStyle(theme.textOnAccent)
+                .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
                 .disabled(!hasSaved)
                 .padding(.horizontal)
                 .padding(.bottom)
             }
             .padding(.top, 30)
+            .background(theme.background)
             .crossPlatformInlineNavigationTitle()
             .interactiveDismissDisabled()
         }
@@ -2929,14 +3068,17 @@ private struct RemoteJoinSheet: View {
 ///     the user must obtain a new invitation to join again.
 private struct SavedMemberPoolsSection: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
     @State private var pendingForget: RemoteMemberRecord?
 
     var body: some View {
-        VStack(spacing: 8) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(spacing: theme.spacingS) {
             HStack {
-                Text("Your Pools")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                PoolText("connectionpool.savedPools.title", fallback: "Your Pools")
+                    .font(theme.fontCaption)
+                    .foregroundColor(theme.textSecondary)
                 Spacer()
             }
             ForEach(viewModel.savedRemoteMemberPools, id: \.compositeKey) { record in
@@ -2948,22 +3090,22 @@ private struct SavedMemberPoolsSection: View {
             }
         }
         .alert(
-            "Forget this pool?",
+            poolString("connectionpool.savedPools.forgetTitle", fallback: "Forget this pool?"),
             isPresented: Binding(
                 get: { pendingForget != nil },
                 set: { if !$0 { pendingForget = nil } }
             ),
             presenting: pendingForget
         ) { record in
-            Button("Forget", role: .destructive) {
+            Button(poolString("connectionpool.savedPools.forget", fallback: "Forget"), role: .destructive) {
                 viewModel.forgetRemoteMemberPool(record)
                 pendingForget = nil
             }
-            Button("Cancel", role: .cancel) {
+            Button(poolString("common.cancel", fallback: "Cancel"), role: .cancel) {
                 pendingForget = nil
             }
         } message: { _ in
-            Text("You'll need a new invitation to join again.")
+            Text(poolString("connectionpool.leave.message", fallback: "You'll need a new invitation to join again."))
         }
     }
 }
@@ -2973,46 +3115,48 @@ private struct SavedMemberPoolRow: View {
     let onRejoin: () -> Void
     let onForget: () -> Void
 
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
-        HStack(spacing: 10) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        HStack(spacing: theme.spacingS + 2) {
             Button(action: onRejoin) {
-                HStack(spacing: 12) {
-                    Image(systemName: "arrow.clockwise.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(.purple)
+                HStack(spacing: theme.spacingM) {
+                    PoolIcon("arrows-rotate", size: 18, systemFallback: "arrow.clockwise.circle.fill")
+                        .foregroundColor(theme.info)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(record.displayName.isEmpty ? "Remote Pool" : record.displayName)
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.primary)
+                        Text(record.displayName.isEmpty ? poolString("connectionpool.savedPools.remotePool", fallback: "Remote Pool") : record.displayName)
+                            .font(theme.fontBody.weight(.semibold))
+                            .foregroundColor(theme.textPrimary)
                         Text(record.serverURL)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundColor(theme.textSecondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                         if let last = record.lastSuccessfulConnectAt {
-                            Text("Last connected \(last, style: .relative) ago")
+                            Text(poolString("connectionpool.savedPools.lastConnected", fallback: "Last connected \(last.formatted(.relative(presentation: .named))) ago", args: ["time": last.formatted(.relative(presentation: .named))]))
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundColor(theme.textSecondary)
                         }
                     }
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .foregroundStyle(.secondary)
+                    PoolIcon("chevron-right", size: 13, systemFallback: "chevron.right")
+                        .foregroundColor(theme.textSecondary)
                 }
             }
             .buttonStyle(.plain)
 
             Button(role: .destructive, action: onForget) {
-                Image(systemName: "trash")
-                    .font(.subheadline)
-                    .foregroundStyle(.red)
-                    .padding(8)
+                PoolIcon("trash", size: 15, systemFallback: "trash")
+                    .foregroundColor(theme.danger)
+                    .padding(theme.spacingS)
             }
             .buttonStyle(.plain)
         }
         .padding()
-        .background(Color.purple.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.info.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
 
@@ -3023,41 +3167,45 @@ private struct SavedMemberPoolRow: View {
 
 private struct RemoteInvitationsCard: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
+    @ObservedObject private var design = PoolDesign.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let theme = design.snapshot(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: theme.spacingS + 2) {
             HStack {
-                Image(systemName: "link")
-                    .foregroundStyle(.purple)
-                Text("Active Invitations")
-                    .font(.subheadline.bold())
+                PoolIcon("link", size: 15, systemFallback: "link")
+                    .foregroundColor(theme.info)
+                PoolText("connectionpool.invitations.title", fallback: "Active Invitations")
+                    .font(theme.fontBody.weight(.semibold))
+                    .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
                 Text("\(viewModel.remoteInvitations.filter { !$0.isExpired }.count)")
-                    .font(.caption.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.purple)
+                    .font(theme.fontCaption.weight(.bold))
+                    .foregroundColor(theme.textOnAccent)
+                    .padding(.horizontal, theme.spacingS)
+                    .padding(.vertical, theme.spacingXS)
+                    .background(theme.info)
                     .clipShape(Capsule())
             }
 
             ForEach(viewModel.remoteInvitations) { invitation in
-                HStack(spacing: 10) {
+                HStack(spacing: theme.spacingS + 2) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(invitation.tokenId.prefix(8) + "...")
                             .font(.caption.monospaced())
-                            .foregroundStyle(.primary)
+                            .foregroundColor(theme.textPrimary)
 
                         if invitation.isExpired {
-                            Text("Expired")
+                            PoolText("connectionpool.invitations.expired", fallback: "Expired")
                                 .font(.caption2)
-                                .foregroundStyle(.red)
+                                .foregroundColor(theme.danger)
                         } else {
-                            Text("Expires \(invitation.expiresAt, style: .relative)")
+                            Text(poolString("connectionpool.invitations.expires", fallback: "Expires \(invitation.expiresAt.formatted(.relative(presentation: .named)))", args: ["time": invitation.expiresAt.formatted(.relative(presentation: .named))]))
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundColor(theme.textSecondary)
                         }
                     }
 
@@ -3067,11 +3215,10 @@ private struct RemoteInvitationsCard: View {
                         Button {
                             viewModel.shareInvitation(invitation)
                         } label: {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.subheadline)
-                                .foregroundStyle(.purple)
-                                .padding(8)
-                                .background(Color.purple.opacity(0.1))
+                            PoolIcon("share", size: 15, systemFallback: "square.and.arrow.up")
+                                .foregroundColor(theme.info)
+                                .padding(theme.spacingS)
+                                .background(theme.info.opacity(0.1))
                                 .clipShape(Circle())
                         }
                     }
@@ -3079,11 +3226,10 @@ private struct RemoteInvitationsCard: View {
                     Button {
                         viewModel.remoteInvitations.removeAll { $0.id == invitation.id }
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .padding(6)
-                            .background(Color.secondary.opacity(0.1))
+                        PoolIcon("xmark", size: 11, systemFallback: "xmark")
+                            .foregroundColor(theme.textSecondary)
+                            .padding(theme.spacingXS + 2)
+                            .background(theme.surfaceSecondary)
                             .clipShape(Circle())
                     }
                 }
@@ -3091,7 +3237,7 @@ private struct RemoteInvitationsCard: View {
             }
         }
         .padding()
-        .background(Color.purple.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(theme.info.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
     }
 }
