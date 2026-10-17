@@ -17,7 +17,8 @@ final class WebSocketTransportRejoinTests: XCTestCase {
 
     private let serverURLString = "wss://rejoin-test.example/ws"
 
-    override func tearDown() {
+    // Async tearDown inherits the class's @MainActor isolation.
+    override func tearDown() async throws {
         // Wipe every per-pool slot a test might have created.
         let recs = RemoteMemberRecordStore.allRecords()
         for rec in recs {
@@ -25,7 +26,7 @@ final class WebSocketTransportRejoinTests: XCTestCase {
             RemoteMemberRecordStore.remove(serverURL: rec.serverURL, poolID: rec.poolID)
         }
         RemoteMemberRecordStore.clearAll()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - Helpers

@@ -22,6 +22,7 @@
 // Views observe `PoolDesign.shared` and read `poolTheme(scheme)` so theme,
 // appearance, and language switches re-render live.
 
+import Combine
 import SwiftUI
 
 /// Weight of an injected icon glyph (maps to IconKit's regular / solid faces).

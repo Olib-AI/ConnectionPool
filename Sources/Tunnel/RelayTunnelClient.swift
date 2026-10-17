@@ -420,7 +420,8 @@ public actor RelayTunnelClient: RelayTunnelClientType {
         nextDnsQueryId &+= 1
 
         let answers: [DnsAnswer] = try await withThrowingTaskGroup(of: [DnsAnswer].self) { group in
-            group.addTask { [transport] in
+            // `self` is already retained by this awaiting call; capture it explicitly.
+            group.addTask { [self, transport] in
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[DnsAnswer], Error>) in
                     Task { [weak self] in
                         await self?.installDnsContinuation(queryId: queryId, continuation: continuation)

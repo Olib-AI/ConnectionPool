@@ -4,6 +4,7 @@
 // Created by Olib AI (www.olib.ai)
 // StealthOS - stealthos.app
 
+import Combine
 import Foundation
 import CryptoKit
 import Security

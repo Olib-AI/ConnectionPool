@@ -7,10 +7,11 @@ import XCTest
 @MainActor
 final class RemotePoolStateTests: XCTestCase {
 
-    override func tearDown() {
+    // Async tearDown inherits the class's @MainActor isolation.
+    override func tearDown() async throws {
         // Clean up UserDefaults between tests
         RemotePoolState.clear()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     func testSaveAndLoad() {

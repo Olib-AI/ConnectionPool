@@ -10,10 +10,12 @@ import XCTest
 @MainActor
 final class RemoteMemberRecordStoreTests: XCTestCase {
 
-    override func tearDown() {
+    // The async variant inherits the class's @MainActor isolation, so the
+    // main-actor store and configuration can be reset without a hop.
+    override func tearDown() async throws {
         RemoteMemberRecordStore.clearAll()
         ConnectionPoolConfiguration.remotePoolStateStorageProvider = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - Round-trip via UserDefaults
