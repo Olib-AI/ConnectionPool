@@ -1,0 +1,419 @@
+{
+  "description" : "RelayEnvelope routing-metadata HMAC-SHA256 and its JSON wire form (default JSONEncoder: Date = seconds since 2001 as a JSON number, Data = base64, UUID = uppercase string).",
+  "format" : "relay-envelope-hmac",
+  "notes" : [
+    "HMAC input = be32(len) || origin UTF-8 || be32(len) || (destination ?? \"\") UTF-8 || pool_id(16) || message_id(16) || maxTTL as 8-byte LITTLE-endian Int (always 5) || timeIntervalSince1970 as 8-byte LITTLE-endian IEEE-754 double.",
+    "The two trailing integers are written with native byte order (withUnsafeBytes) - little-endian on every Apple platform; a port must hard-code LE.",
+    "timeIntervalSince1970 is computed as (JSON timestamp, seconds since 2001) + 978307200.0 in f64; use timestamp_since_1970_f64_le_hex, do not re-derive from a decimal string.",
+    "NOT covered by the MAC: ttl, hopPath (by design) and encryptedPayload. nil and \"\" destinations produce the same MAC input.",
+    "verifyHMAC returns false when the HMAC is missing; comparison is constant-time (CryptoKit isValidAuthenticationCode)."
+  ],
+  "schema_version" : 1,
+  "sources" : [
+    "LocalPackages/ConnectionPool/Sources/Models/RelayEnvelope.swift"
+  ],
+  "vectors" : [
+    {
+      "description" : "HMAC key = HKDF-SHA256(ikm = pool shared secret, salt = pool_id(16) || 'StealthOS-RelayEnvelope-HMAC-Salt', info = 'envelope-integrity-v1', 32).",
+      "expect" : "ok",
+      "inputs" : {
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "hmac_key",
+      "name" : "hmac_key",
+      "outputs" : {
+        "hmac_key_hex" : "137bb5f11cd337d763056ef22609eab041f84342c2ab45ff506729ccb529af4d"
+      }
+    },
+    {
+      "description" : "Directed message.",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "peer-dest",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "peer-origin",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "directed",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"destinationPeerID\":\"peer-dest\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"hopPath\":[],\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "644e157e9308bad3ed5fcaaa43c9186deac80b4ff60b825a57153093cbf62183",
+        "hmac_input_hex" : "0000000b706565722d6f726967696e00000009706565722d64657374a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "Broadcast (destinationPeerID nil).",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : null,
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "peer-origin",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "broadcast_nil_destination",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"XblH7batb\\/izSz\\/NhvfLRil4V7DIVRe94lSUGvdKXvE=\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "5db947edb6ad6ff8b34b3fcd86f7cb46297857b0c85517bde254941af74a5ef1",
+        "hmac_input_hex" : "0000000b706565722d6f726967696e00000000a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "destinationPeerID \"\" - HMAC input identical to the broadcast case.",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "peer-origin",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "empty_string_destination",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"XblH7batb\\/izSz\\/NhvfLRil4V7DIVRe94lSUGvdKXvE=\",\"timestamp\":821692800,\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"destinationPeerID\":\"\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"hopPath\":[],\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "5db947edb6ad6ff8b34b3fcd86f7cb46297857b0c85517bde254941af74a5ef1",
+        "hmac_input_hex" : "0000000b706565722d6f726967696e00000000a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "origin 'ab', destination 'cd'.",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "cd",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "ab",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "length_prefix_ab_cd",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"ab\",\"ttl\":5,\"envelopeHMAC\":\"HKhySWkXHtUeCqF2mm6Tdq4zvLuC+kRiubS84dq4krw=\",\"timestamp\":821692800,\"hopPath\":[],\"destinationPeerID\":\"cd\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "1ca8724969171ed51e0aa1769a6e9376ae33bcbb82fa4462b9b4bce1dab892bc",
+        "hmac_input_hex" : "000000026162000000026364a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "origin 'abc', destination 'd': same concatenation, different HMAC thanks to the length prefixes.",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "d",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "abc",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "length_prefix_abc_d",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"abc\",\"ttl\":5,\"envelopeHMAC\":\"2tSbWZM2vHWlrju83JE8qhrSCBdpYMNtLoCNBkWDw8U=\",\"timestamp\":821692800,\"hopPath\":[],\"destinationPeerID\":\"d\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "dad49b599336bc75a5ae3bbcdc913caa1ad208176960c36d2e808d064583c3c5",
+        "hmac_input_hex" : "000000036162630000000164a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "Unicode peer IDs (UTF-8 bytes are MACed).",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "éric",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "éric 🔐",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "unicode_peers",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"éric 🔐\",\"ttl\":5,\"envelopeHMAC\":\"CkCXtGx8wPzAfvoK2ENJuu4OUtjYkvJ9L0W2Hnk56Qs=\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"destinationPeerID\":\"éric\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "0a4097b46c7cc0fcc07efa0ad84349baee0e52d8d892f27d2f45b61e7939e90b",
+        "hmac_input_hex" : "0000000ac3a972696320f09f94900000000665cc81726963a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "Fractional timestamp: the MAC covers the f64 bits of timeIntervalSince1970.",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "peer-dest",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "peer-origin",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "fractional_timestamp",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"HYIVf2OVTaoZ6rqbzqPEZC57Cj9N9ex\\/vhyZUsPxCcE=\",\"timestamp\":821692800.123456,\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"destinationPeerID\":\"peer-dest\",\"hopPath\":[],\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "1d82157f63954daa19eaba9bcea3c4642e7b0a3f4df5ec7fbe1c9952c3f109c1",
+        "hmac_input_hex" : "0000000b706565722d6f726967696e00000009706565722d64657374a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f00500000000000000b4e6078074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "b4e6078074d2da41",
+        "timestamp_since_2001" : 821692800.123456
+      }
+    },
+    {
+      "description" : "After one hop: ttl 4 and a hop path; HMAC unchanged (ttl/hopPath not covered).",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "peer-dest",
+        "hop_path" : [
+          "relay-1"
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "peer-origin",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 4
+      },
+      "kind" : "envelope",
+      "name" : "relayed_hop",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":4,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"hopPath\":[\"relay-1\"],\"destinationPeerID\":\"peer-dest\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "644e157e9308bad3ed5fcaaa43c9186deac80b4ff60b825a57153093cbf62183",
+        "hmac_input_hex" : "0000000b706565722d6f726967696e00000009706565722d64657374a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "ttl 99 is clamped to maxTTL (5) at init.",
+      "expect" : "ok",
+      "inputs" : {
+        "destination_peer_id" : "peer-dest",
+        "hop_path" : [
+
+        ],
+        "message_id" : "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0",
+        "origin_peer_id" : "peer-origin",
+        "payload_hex" : "6532652d63697068657274657874",
+        "pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b",
+        "ttl" : 5
+      },
+      "kind" : "envelope",
+      "name" : "ttl_clamped",
+      "outputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[],\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"destinationPeerID\":\"peer-dest\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "hmac_hex" : "644e157e9308bad3ed5fcaaa43c9186deac80b4ff60b825a57153093cbf62183",
+        "hmac_input_hex" : "0000000b706565722d6f726967696e00000009706565722d64657374a0a0a0a0b1b14c2c8d3de4e4e4e4e4e40f1e2d3c4b5a49788695a4b3c2d1e0f005000000000000000000008074d2da41",
+        "timestamp_since_1970_f64_le_hex" : "0000008074d2da41",
+        "timestamp_since_2001" : 821692800
+      }
+    },
+    {
+      "description" : "originPeerID changed.",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"timestamp\":821692800,\"destinationPeerID\":\"peer-dest\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[],\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"originPeerID\":\"peer-evil\",\"ttl\":5,\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "tamper_origin",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "destination removed (nil).",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "tamper_destination_to_broadcast",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "poolID changed (receiver derives its key from its own pool).",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"timestamp\":821692800,\"destinationPeerID\":\"peer-dest\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[],\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"originPeerID\":\"peer-origin\",\"ttl\":5,\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E5\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "tamper_pool_id",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "messageID changed.",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F1\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"destinationPeerID\":\"peer-dest\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "tamper_message_id",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "timestamp +1 s.",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"timestamp\":821692801,\"destinationPeerID\":\"peer-dest\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[],\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"originPeerID\":\"peer-origin\",\"ttl\":5,\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "tamper_timestamp",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "One HMAC bit flipped.",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZU4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"destinationPeerID\":\"peer-dest\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "tamper_hmac_bit",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "No HMAC at all.",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"timestamp\":821692800,\"destinationPeerID\":\"peer-dest\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[],\"originPeerID\":\"peer-origin\",\"ttl\":5,\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "missing_hmac",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "HMAC cut to 16 bytes.",
+      "expect" : "error",
+      "inputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYbQ==\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"destinationPeerID\":\"peer-dest\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "truncated_hmac",
+      "outputs" : {
+        "verifies" : false
+      }
+    },
+    {
+      "description" : "ttl and hopPath rewritten: NOT covered, still verifies (by design).",
+      "expect" : "ok",
+      "inputs" : {
+        "envelope_json" : "{\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"timestamp\":821692800,\"destinationPeerID\":\"peer-dest\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[\"a\",\"b\",\"c\"],\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"originPeerID\":\"peer-origin\",\"ttl\":1,\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "swap_ttl_and_hops",
+      "outputs" : {
+        "verifies" : true
+      }
+    },
+    {
+      "description" : "encryptedPayload replaced: NOT covered, still verifies.",
+      "expect" : "ok",
+      "inputs" : {
+        "envelope_json" : "{\"originPeerID\":\"peer-origin\",\"ttl\":5,\"envelopeHMAC\":\"ZE4VfpMIutPtX8qqQ8kYberIC0\\/2C4JaVxUwk8v2IYM=\",\"timestamp\":821692800,\"hopPath\":[],\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"encryptedPayload\":\"b3RoZXItY2lwaGVydGV4dA==\",\"destinationPeerID\":\"peer-dest\",\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "swap_payload",
+      "outputs" : {
+        "verifies" : true
+      }
+    },
+    {
+      "description" : "Broadcast relabelled with destination \"\": same HMAC input, still verifies.",
+      "expect" : "ok",
+      "inputs" : {
+        "envelope_json" : "{\"encryptedPayload\":\"ZTJlLWNpcGhlcnRleHQ=\",\"timestamp\":821692800,\"destinationPeerID\":\"\",\"messageID\":\"0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0\",\"hopPath\":[],\"envelopeHMAC\":\"XblH7batb\\/izSz\\/NhvfLRil4V7DIVRe94lSUGvdKXvE=\",\"originPeerID\":\"peer-origin\",\"ttl\":5,\"poolID\":\"A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4\"}",
+        "receiver_pool_id" : "A0A0A0A0-B1B1-4C2C-8D3D-E4E4E4E4E4E4",
+        "shared_secret_hex" : "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b"
+      },
+      "kind" : "envelope_tamper",
+      "name" : "destination_nil_to_empty",
+      "outputs" : {
+        "verifies" : true
+      }
+    }
+  ],
+  "verification" : "production+reference"
+}

@@ -86,6 +86,18 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
     /// This prevents relay nodes from tampering with routing metadata (TTL, hop path, origin).
     public var envelopeHMAC: Data?
 
+    /// Envelope integrity version. `nil` (absent on the wire) means v1, the only format
+    /// StealthOS 1.4.x and older emit; `2` means the envelope carries ``envelopeHMACV2``.
+    public var envelopeVersion: Int?
+
+    /// The TTL the origin created the envelope with. Bound by the v2 MAC so relays can
+    /// never raise the per-hop ``ttl`` above it. `nil` on v1 envelopes.
+    public var originTTL: Int?
+
+    /// v2 HMAC (see ``computeHMACV2(using:)``). Covers every field except the per-hop
+    /// mutable ``ttl`` and ``hopPath`` and both MAC fields. `nil` on v1 envelopes.
+    public var envelopeHMACV2: Data?
+
     // MARK: - Constants
 
     /// Maximum allowed TTL value.
@@ -125,7 +137,10 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
         encryptedPayload: Data,
         poolID: UUID,
         timestamp: Date = Date(),
-        envelopeHMAC: Data? = nil
+        envelopeHMAC: Data? = nil,
+        envelopeVersion: Int? = nil,
+        originTTL: Int? = nil,
+        envelopeHMACV2: Data? = nil
     ) {
         self.messageID = messageID
         self.originPeerID = originPeerID
@@ -136,6 +151,9 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
         self.poolID = poolID
         self.timestamp = timestamp
         self.envelopeHMAC = envelopeHMAC
+        self.envelopeVersion = envelopeVersion
+        self.originTTL = originTTL
+        self.envelopeHMACV2 = envelopeHMACV2
     }
 
     // MARK: - Relay Operations
@@ -159,10 +177,10 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
         // Envelopes exceeding this limit are considered suspicious and rejected.
         guard newHopPath.count <= Self.maxTTL + 1 else { return nil }
 
-        // NOTE: The HMAC is preserved from the original envelope. It covers immutable
-        // fields (origin, destination, poolID, messageID, original ttl, timestamp).
-        // The hop path and current ttl are mutable relay metadata and are NOT covered
-        // by the HMAC — they change at each hop by design.
+        // NOTE: Both HMACs and the v2 fields are preserved from the original envelope.
+        // They cover immutable fields only. The hop path and current ttl are mutable
+        // relay metadata and change at each hop by design; v2 bounds ttl by the MAC'd
+        // originTTL instead (see verifyV2RoutingInvariants).
         return RelayEnvelope(
             messageID: messageID,
             originPeerID: originPeerID,
@@ -172,7 +190,10 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
             encryptedPayload: encryptedPayload,
             poolID: poolID,
             timestamp: timestamp,
-            envelopeHMAC: envelopeHMAC
+            envelopeHMAC: envelopeHMAC,
+            envelopeVersion: envelopeVersion,
+            originTTL: originTTL,
+            envelopeHMACV2: envelopeHMACV2
         )
     }
 

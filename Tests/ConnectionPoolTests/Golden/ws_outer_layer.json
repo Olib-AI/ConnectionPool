@@ -1,0 +1,146 @@
+{
+  "description" : "WebSocketTransport outer layer, applied to every relayed payload once poolSharedSecret is set (inner E2E encryption is separate).",
+  "format" : "ws-outer-layer",
+  "notes" : [
+    "wsEncryptionKey/encryptForWS/decryptFromWS are private in WebSocketTransport (separate repo), so these vectors are verified by the reference implementation only.",
+    "HKDF is called without a salt: identical to an empty salt and to 32 zero bytes (RFC 5869).",
+    "Before a shared secret is configured, frames pass through as plaintext in both directions."
+  ],
+  "schema_version" : 1,
+  "sources" : [
+    "LocalPackages/ConnectionPool/Sources/Transport/WebSocketTransport.swift"
+  ],
+  "vectors" : [
+    {
+      "description" : "Outer-layer key: HKDF-SHA256(ikm = pool shared secret, salt = empty, info = 'stealth-ws-encrypt', 32).",
+      "expect" : "ok",
+      "inputs" : {
+        "info" : "stealth-ws-encrypt",
+        "pool_secret_hex" : "0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526"
+      },
+      "kind" : "ws_key",
+      "name" : "secret_sequential_32",
+      "outputs" : {
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      }
+    },
+    {
+      "description" : "Outer-layer key: HKDF-SHA256(ikm = pool shared secret, salt = empty, info = 'stealth-ws-encrypt', 32).",
+      "expect" : "ok",
+      "inputs" : {
+        "info" : "stealth-ws-encrypt",
+        "pool_secret_hex" : "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "kind" : "ws_key",
+      "name" : "secret_zero_32",
+      "outputs" : {
+        "ws_key_hex" : "031afe155a1ae77f5c26a2cdcb2bf42a5eeef4edc8881fdcda76ae6a4e673327"
+      }
+    },
+    {
+      "description" : "Outer-layer key: HKDF-SHA256(ikm = pool shared secret, salt = empty, info = 'stealth-ws-encrypt', 32).",
+      "expect" : "ok",
+      "inputs" : {
+        "info" : "stealth-ws-encrypt",
+        "pool_secret_hex" : "999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8"
+      },
+      "kind" : "ws_key",
+      "name" : "secret_16_bytes",
+      "outputs" : {
+        "ws_key_hex" : "eb0f8fb4bec1615247f162fa84d7f42443cdf5246a1acd49a4148a49c42df4ac"
+      }
+    },
+    {
+      "description" : "One outer-encrypted WebSocket payload: AES-256-GCM combined nonce(12)||ciphertext||tag(16), no AAD.",
+      "expect" : "ok",
+      "inputs" : {
+        "blob_hex" : "3132333435363738393a3b3c7df233a73d605d26eed1ff02e0842291750103cf6f36b735facd4981386bd51c6837b36a98b3c52f6c90a9e09542ccb7e8f2e2890177296313bfa830f7777c0446621c74",
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      },
+      "kind" : "ws_frame",
+      "name" : "frame_json",
+      "outputs" : {
+        "plaintext_hex" : "7b2274797065223a2263686174222c227061796c6f6164223a2261476b3d222c2273656e6465724944223a22706565722d31227d"
+      }
+    },
+    {
+      "description" : "One outer-encrypted WebSocket payload: AES-256-GCM combined nonce(12)||ciphertext||tag(16), no AAD.",
+      "expect" : "ok",
+      "inputs" : {
+        "blob_hex" : "3132333435363738393a3b3ce3a6c49ce08d75725a0cf8173ed5d28a",
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      },
+      "kind" : "ws_frame",
+      "name" : "frame_empty",
+      "outputs" : {
+        "plaintext_hex" : ""
+      }
+    },
+    {
+      "description" : "Must be dropped (decryptFromWS returns nil once a shared secret is set).",
+      "expect" : "error",
+      "inputs" : {
+        "blob_hex" : "3132333435363738393a3b3c7df233a73d605d26eed1ff02e0842291750103cf6f36b735facd4981386bd51c6837b36a98b3c52f6c90a9e09542ccb7e8f2e2890177296313bfa830f7777c0446621c75",
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      },
+      "kind" : "ws_frame",
+      "name" : "tampered_tag",
+      "outputs" : {
+
+      }
+    },
+    {
+      "description" : "Must be dropped (decryptFromWS returns nil once a shared secret is set).",
+      "expect" : "error",
+      "inputs" : {
+        "blob_hex" : "3032333435363738393a3b3c7df233a73d605d26eed1ff02e0842291750103cf6f36b735facd4981386bd51c6837b36a98b3c52f6c90a9e09542ccb7e8f2e2890177296313bfa830f7777c0446621c74",
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      },
+      "kind" : "ws_frame",
+      "name" : "tampered_nonce",
+      "outputs" : {
+
+      }
+    },
+    {
+      "description" : "Must be dropped (decryptFromWS returns nil once a shared secret is set).",
+      "expect" : "error",
+      "inputs" : {
+        "blob_hex" : "3132333435363738393a3b3c7df233a73d605d26eed1ff02e08422",
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      },
+      "kind" : "ws_frame",
+      "name" : "truncated_27",
+      "outputs" : {
+
+      }
+    },
+    {
+      "description" : "Must be dropped (decryptFromWS returns nil once a shared secret is set).",
+      "expect" : "error",
+      "inputs" : {
+        "blob_hex" : "3132333435363738393a3b3c",
+        "ws_key_hex" : "9e24f985c6488cbb0d52618ce42a1cb247a7e187039841b790a6320270370b4d"
+      },
+      "kind" : "ws_frame",
+      "name" : "truncated_12",
+      "outputs" : {
+
+      }
+    },
+    {
+      "description" : "Must be dropped (decryptFromWS returns nil once a shared secret is set).",
+      "expect" : "error",
+      "inputs" : {
+        "blob_hex" : "3132333435363738393a3b3c7df233a73d605d26eed1ff02e0842291750103cf6f36b735facd4981386bd51c6837b36a98b3c52f6c90a9e09542ccb7e8f2e2890177296313bfa830f7777c0446621c74",
+        "ws_key_hex" : "3afd28c1a0d11c86befb846f124e5e677b870d4ae8a355cdab5301ad02c6a3f2"
+      },
+      "kind" : "ws_frame",
+      "name" : "wrong_pool_secret",
+      "outputs" : {
+
+      }
+    }
+  ],
+  "verification" : "reference-only"
+}

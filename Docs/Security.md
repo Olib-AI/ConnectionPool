@@ -39,7 +39,7 @@ Provided by [StealthRelay](https://github.com/Olib-AI/StealthRelay).
 | **E2E Relay Encryption** | AES-GCM encryption with a key derived from the pool shared secret via HKDF-SHA256 (`stealth-ws-encrypt` info); the relay server sees only opaque ciphertext |
 | **Session Tokens** | 32-byte server-issued token required for all privileged operations from both host and guest peers; included in Forward frames for all roles (constant-time comparison) |
 | **Invitation Tokens** | Ed25519-signed URLs with HMAC proof-of-possession, configurable expiry and max uses, `server_address` bound in signature |
-| **Proof-of-Work** | SHA-256 hashcash (18-bit difficulty) required before join requests are forwarded to the host |
+| **Proof-of-Work** | SHA-256 hashcash (18-bit difficulty) required before join requests are forwarded to the host. The client refuses challenges that are not 32 bytes or ask for more than 26 bits (the relay's top tier), solves under a 90 s budget, cancels on disconnect, and fails the connection with a clear error otherwise |
 | **TLS Pinning** | SPKI SHA-256 hash pinning via `URLSessionDelegate` (optional, for production deployments) |
 | **Server Claiming** | One-time claim code binds a server to a host identity; the code is destroyed after use |
 | **Display Name Sanitization** | All display names are stripped of control characters and newlines, then truncated to 64 characters before logging or storage |
@@ -47,16 +47,29 @@ Provided by [StealthRelay](https://github.com/Olib-AI/StealthRelay).
 
 ## Relay Envelope Integrity (HMAC-SHA256)
 
-Every outgoing `RelayEnvelope` is signed with an HMAC computed over its immutable routing fields, each length-prefixed to prevent concatenation forgery:
+Envelope integrity is versioned. Version 1 is what StealthOS 1.4.x and older emit; version 2 ships in StealthOS 1.5.0.
 
-- `originPeerID` (length-prefixed)
-- `destinationPeerID` (length-prefixed)
-- `poolID`
-- `messageID`
-- `maxTTL` (constant, not the mutable per-hop TTL)
-- `timestamp`
+**v1** (kept bit-exact for older peers) MACs `originPeerID` and `destinationPeerID` (length-prefixed, but `nil` and `""` encode identically), `poolID`, `messageID`, the constant `maxTTL` and the timestamp (native byte order). It does **not** cover `encryptedPayload`.
 
-The HMAC key is derived from a pool-level shared secret (not the pool UUID) using HKDF-SHA256. Verification uses CryptoKit's constant-time `isValidAuthenticationCode`. Envelopes without HMAC are rejected, with no backwards-compatibility fallback.
+**v2** adds a second MAC under a separate key, `HKDF-SHA256(secret, salt: poolID || "StealthOS-RelayEnvelope-HMAC-Salt", info: "envelope-integrity-v2")`, over (all integers big-endian):
+
+```
+u32 len || "STEALTH_RELAY_ENVELOPE_V2"
+u32 len || originPeerID (UTF-8)
+0x00 (broadcast)  |  0x01 || u32 len || destinationPeerID (UTF-8)
+poolID (16) || messageID (16)
+u32 originTTL
+u64 IEEE-754 bits of the JSON timestamp (seconds since 2001)
+u64 len || encryptedPayload
+```
+
+New JSON keys: `envelopeVersion` (2), `originTTL`, `envelopeHMACV2`. A 1.5.0 origin attaches **both** MACs, so 1.4.x relays and receivers keep working. 1.5.0 receivers verify only the v2 MAC whenever any v2 key is present, so stripping or corrupting part of v2 never falls back to v1.
+
+The per-hop `ttl` and `hopPath` cannot be MAC'd by the origin. v2 binds `originTTL` instead and enforces `1 <= ttl <= originTTL <= 5`, `hopPath[0] == originPeerID` and `hopPath.count + ttl == originTTL + 1`: a relay can never grant more hops than the origin did. Timestamps more than 120 s in the future are rejected so an envelope cannot outlive the deduplication cache.
+
+**Downgrade rule.** `PeerProtocolLedger` (shared through `ConnectionPoolManager.wireProtocolLedger`) remembers every origin that has sent a valid v2 envelope. A v1-only envelope from such an origin is refused for the rest of the session. A v1-only envelope from an origin never seen with v2 is accepted under the default `LegacyPeerPolicy.warn` and the origin is published in `MeshRelayService.legacyEnvelopeOrigins` for an "older, less secure version" indicator. Set the ledger's policy to `.refuse` to drop v1 entirely.
+
+The pool-wide key means any pool member can still produce valid MACs; the MAC protects against relays and observers that do not hold the pool secret. Golden vectors: `Tests/ConnectionPoolTests/Golden/relay_envelope_hmac_v2.json`.
 
 ## Loop and Amplification Prevention
 

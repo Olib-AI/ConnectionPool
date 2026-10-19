@@ -1,0 +1,292 @@
+{
+  "description" : "Byte layouts signed or MACed between the iOS client and StealthRelay. Integers are big-endian; pool_id is the 16 raw UUID bytes (RFC 4122 order).",
+  "format" : "relay-transcripts",
+  "notes" : [
+    "Ed25519 signatures from CryptoKit are randomised: signature_hex verifies under ed25519_public_hex but is not reproducible. Verify, never compare.",
+    "PoW hash is SHA-256 on BOTH sides: Swift WebSocketTransport.solvePoW and Rust stealthos-crypto pow_hash (the Rust module doc comment still says BLAKE2b-256; the code uses sha2::Sha256).",
+    "The Swift solver accepts any challenge length and any difficulty 0-255; the Rust side issues 32-byte challenges. A difficulty above what SHA-256 output can satisfy makes the Swift solver loop forever.",
+    "The invite HKDF salt is the raw pool_id; info is the ASCII label immediately followed by the raw 16-byte token id. Rust additionally publishes commitment = BLAKE2b-256(vk), which the client never computes.",
+    "host_auth appends the server nonce bytes exactly as decoded from base64 (any length)."
+  ],
+  "schema_version" : 1,
+  "sources" : [
+    "LocalPackages/ConnectionPool/Sources/Transport/WebSocketTransport.swift",
+    "LocalPackages/ConnectionPool/Sources/Transport/RemotePoolService.swift",
+    "LocalPackages/ConnectionPool/Sources/Transport/RemoteMemberIdentity.swift",
+    "StealthRelay/crates/stealthos-crypto/src/pow.rs",
+    "StealthRelay/crates/stealthos-crypto/src/invitation.rs",
+    "StealthRelay/crates/stealthos-server/src/handler.rs"
+  ],
+  "vectors" : [
+    {
+      "description" : "host_auth Ed25519 transcript; the server nonce arrives base64 in AuthChallenge and its raw bytes are appended.",
+      "expect" : "ok",
+      "inputs" : {
+        "ed25519_private_hex" : "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "server_nonce_b64" : "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8=",
+        "server_nonce_hex" : "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "timestamp" : 1714752345
+      },
+      "kind" : "host_auth",
+      "name" : "host_auth_basic",
+      "outputs" : {
+        "ed25519_public_hex" : "ed54a59fb1ac3a51239351362941b868e85a60e3d7b2485d828821dc7a69c279",
+        "host_fingerprint_hex" : "5eb94e50e45acc7e",
+        "signature_hex" : "860b69120539e636ad07e7f7a8120869f169043897575b39c216f5074c18651ce91100787d41036fc009219a87492cab0d81e9dacbae1a507fd3066a095c4f00",
+        "transcript_hex" : "535445414c54485f484f53545f415554485f56313a111111112222333344445555555555550000000066350b59a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+      }
+    },
+    {
+      "description" : "host_auth Ed25519 transcript; the server nonce arrives base64 in AuthChallenge and its raw bytes are appended.",
+      "expect" : "ok",
+      "inputs" : {
+        "ed25519_private_hex" : "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "server_nonce_b64" : "sLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs8=",
+        "server_nonce_hex" : "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+        "timestamp" : -1
+      },
+      "kind" : "host_auth",
+      "name" : "host_auth_negative_timestamp",
+      "outputs" : {
+        "ed25519_public_hex" : "ed54a59fb1ac3a51239351362941b868e85a60e3d7b2485d828821dc7a69c279",
+        "host_fingerprint_hex" : "5eb94e50e45acc7e",
+        "signature_hex" : "caeb9dbf1d08f8c64fa5d3f30ea7067a063a7a108f33835b3407e491c1e940cd96244fdc5c10c8a5646f54a566a2d535fbefddabc3015a9a1d04002451d56f0b",
+        "transcript_hex" : "535445414c54485f484f53545f415554485f56313a11111111222233334444555555555555ffffffffffffffffb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+      }
+    },
+    {
+      "description" : "host_auth Ed25519 transcript; the server nonce arrives base64 in AuthChallenge and its raw bytes are appended.",
+      "expect" : "ok",
+      "inputs" : {
+        "ed25519_private_hex" : "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "server_nonce_b64" : "wMHCw8TFxsfIycrLzM3Ozw==",
+        "server_nonce_hex" : "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+        "timestamp" : 1800000000
+      },
+      "kind" : "host_auth",
+      "name" : "host_auth_16_byte_nonce",
+      "outputs" : {
+        "ed25519_public_hex" : "ed54a59fb1ac3a51239351362941b868e85a60e3d7b2485d828821dc7a69c279",
+        "host_fingerprint_hex" : "5eb94e50e45acc7e",
+        "signature_hex" : "2f7db8499483a8ed9d9b9a9b7bd52348a4d463017786876cc039c14ae2c9cecc55a7a23747403d76e09913c6112f3c1f316fe467b51b640046571ea4479f0b07",
+        "transcript_hex" : "535445414c54485f484f53545f415554485f56313a11111111222233334444555555555555000000006b49d200c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+      }
+    },
+    {
+      "description" : "member_rejoin Ed25519 transcript (81 bytes).",
+      "expect" : "ok",
+      "inputs" : {
+        "ed25519_private_hex" : "5152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70",
+        "nonce_hex" : "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "timestamp" : 1714752345
+      },
+      "kind" : "member_rejoin",
+      "name" : "member_rejoin_basic",
+      "outputs" : {
+        "ed25519_public_hex" : "14c70c7e0c4c7712756ebbdfd33317be8fdf76358824e636098912ced81c1fb1",
+        "signature_hex" : "ef40472393a2d6b410a996b36f3c34195b7289346552d200f2a65b478877ac369e473fcaa5215f0649712162624133678b2fd6abdc947fbfa20e7f8b7fd49d07",
+        "transcript_hex" : "535445414c54485f4d454d4245525f52454a4f494e5f56313a111111112222333344445555555555550000000066350b59000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      }
+    },
+    {
+      "description" : "member_rejoin Ed25519 transcript (81 bytes).",
+      "expect" : "ok",
+      "inputs" : {
+        "ed25519_private_hex" : "5152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70",
+        "nonce_hex" : "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "timestamp" : 9223372036854775807
+      },
+      "kind" : "member_rejoin",
+      "name" : "member_rejoin_max_timestamp",
+      "outputs" : {
+        "ed25519_public_hex" : "14c70c7e0c4c7712756ebbdfd33317be8fdf76358824e636098912ced81c1fb1",
+        "signature_hex" : "16e95ff01b28865953bcc37454f9ab256ac76512b666f4a59f17852714bf7718b9c49f10fe64ae8939fecc9ed2ef85942e5e05940c284e3b39a1b6437204a504",
+        "transcript_hex" : "535445414c54485f4d454d4245525f52454a4f494e5f56313a111111112222333344445555555555557fffffffffffffffe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+      }
+    },
+    {
+      "description" : "Invitation join proof: HMAC-SHA256(vk, 'JOIN' || pool_id || timestamp BE || nonce).",
+      "expect" : "ok",
+      "inputs" : {
+        "nonce_hex" : "8182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "timestamp" : 1800000000,
+        "token_id_hex" : "6162636465666768696a6b6c6d6e6f70",
+        "token_secret_hex" : "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"
+      },
+      "kind" : "invite_join_proof",
+      "name" : "invite_join_basic",
+      "outputs" : {
+        "hkdf_info_hex" : "535445414c54485f494e564954455f56316162636465666768696a6b6c6d6e6f70",
+        "hkdf_salt_hex" : "11111111222233334444555555555555",
+        "message_hex" : "4a4f494e11111111222233334444555555555555000000006b49d2008182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0",
+        "proof_b64" : "lL9q5mss/Ma+oWZzFqsKesFl1agSe6otz2K9woc9QqU=",
+        "proof_hex" : "94bf6ae66b2cfcc6bea1667316ab0a7ac165d5a8127baa2dcf62bdc2873d42a5",
+        "verification_key_hex" : "33b8d33caa7f23e15e891c46a59ae87ddfb0037e3ad22cacdc02bc997e1a029a"
+      }
+    },
+    {
+      "description" : "Invitation join proof: HMAC-SHA256(vk, 'JOIN' || pool_id || timestamp BE || nonce).",
+      "expect" : "ok",
+      "inputs" : {
+        "nonce_hex" : "0000000000000000000000000000000000000000000000000000000000000000",
+        "pool_id" : "11111111-2222-3333-4444-555555555555",
+        "timestamp" : 0,
+        "token_id_hex" : "00000000000000000000000000000000",
+        "token_secret_hex" : "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "kind" : "invite_join_proof",
+      "name" : "invite_join_zero_secret",
+      "outputs" : {
+        "hkdf_info_hex" : "535445414c54485f494e564954455f563100000000000000000000000000000000",
+        "hkdf_salt_hex" : "11111111222233334444555555555555",
+        "message_hex" : "4a4f494e1111111122223333444455555555555500000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "proof_b64" : "STcQdOPoMbXTMTBuuFfp+o6sO+nkFw7Obq5ANpv+qrM=",
+        "proof_hex" : "49371074e3e831b5d331306eb857e9fa8eac3be9e4170ece6eae40369bfeaab3",
+        "verification_key_hex" : "11c30b64d9ed42d503a8fb454b45c14c608ea745310156dbe98efacfcc88f5d0"
+      }
+    },
+    {
+      "description" : "PoW: smallest u64 counter n (from 0) with leading_zero_bits(SHA-256('STEALTH_POW' || challenge || n as 8 bytes BE)) >= difficulty.",
+      "expect" : "ok",
+      "inputs" : {
+        "challenge_b64" : "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=",
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 0
+      },
+      "kind" : "pow",
+      "name" : "pow_difficulty_0",
+      "outputs" : {
+        "hash_hex" : "c73ad577c026059ec0d196b99442b04c6b42bc8fca0e088fb960294f597aa623",
+        "leading_zero_bits" : 0,
+        "solution_b64" : "AAAAAAAAAAA=",
+        "solution_hex" : "0000000000000000",
+        "solution_u64" : "0"
+      }
+    },
+    {
+      "description" : "PoW: smallest u64 counter n (from 0) with leading_zero_bits(SHA-256('STEALTH_POW' || challenge || n as 8 bytes BE)) >= difficulty.",
+      "expect" : "ok",
+      "inputs" : {
+        "challenge_b64" : "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=",
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 1
+      },
+      "kind" : "pow",
+      "name" : "pow_difficulty_1",
+      "outputs" : {
+        "hash_hex" : "0eec59dd424f4d4892e9708bba8f36e6aac9126aa5d76bf0c1785062a6a0e908",
+        "leading_zero_bits" : 4,
+        "solution_b64" : "AAAAAAAAAAE=",
+        "solution_hex" : "0000000000000001",
+        "solution_u64" : "1"
+      }
+    },
+    {
+      "description" : "PoW: smallest u64 counter n (from 0) with leading_zero_bits(SHA-256('STEALTH_POW' || challenge || n as 8 bytes BE)) >= difficulty.",
+      "expect" : "ok",
+      "inputs" : {
+        "challenge_b64" : "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=",
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 8
+      },
+      "kind" : "pow",
+      "name" : "pow_difficulty_8",
+      "outputs" : {
+        "hash_hex" : "00e6934f2701887fb12b817ff2bc089f06c81716a9c43fc1cbe2a009d482a268",
+        "leading_zero_bits" : 8,
+        "solution_b64" : "AAAAAAAAAgQ=",
+        "solution_hex" : "0000000000000204",
+        "solution_u64" : "516"
+      }
+    },
+    {
+      "description" : "PoW: smallest u64 counter n (from 0) with leading_zero_bits(SHA-256('STEALTH_POW' || challenge || n as 8 bytes BE)) >= difficulty.",
+      "expect" : "ok",
+      "inputs" : {
+        "challenge_b64" : "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=",
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 12
+      },
+      "kind" : "pow",
+      "name" : "pow_difficulty_12",
+      "outputs" : {
+        "hash_hex" : "00046032d15b1e056e52a2efa55f6f9836a0bd64627af768594f1becff3c66cf",
+        "leading_zero_bits" : 13,
+        "solution_b64" : "AAAAAAAABko=",
+        "solution_hex" : "000000000000064a",
+        "solution_u64" : "1610"
+      }
+    },
+    {
+      "description" : "PoW: smallest u64 counter n (from 0) with leading_zero_bits(SHA-256('STEALTH_POW' || challenge || n as 8 bytes BE)) >= difficulty.",
+      "expect" : "ok",
+      "inputs" : {
+        "challenge_b64" : "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=",
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 16
+      },
+      "kind" : "pow",
+      "name" : "pow_difficulty_16",
+      "outputs" : {
+        "hash_hex" : "00007d40f76933f4ae3ef5872c0ae28ddd2fced861a8086345577086f0c2d2b1",
+        "leading_zero_bits" : 17,
+        "solution_b64" : "AAAAAAABdGA=",
+        "solution_hex" : "0000000000017460",
+        "solution_u64" : "95328"
+      }
+    },
+    {
+      "description" : "PoW: smallest u64 counter n (from 0) with leading_zero_bits(SHA-256('STEALTH_POW' || challenge || n as 8 bytes BE)) >= difficulty.",
+      "expect" : "ok",
+      "inputs" : {
+        "challenge_b64" : "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=",
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 20
+      },
+      "kind" : "pow",
+      "name" : "pow_difficulty_20",
+      "outputs" : {
+        "hash_hex" : "00000732eb9d082d83e772f6fcafc3b0b368c8b1593dedb736e8a1c6be0839bc",
+        "leading_zero_bits" : 21,
+        "solution_b64" : "AAAAAAAEc6s=",
+        "solution_hex" : "00000000000473ab",
+        "solution_u64" : "291755"
+      }
+    },
+    {
+      "description" : "A counter below the minimal solution that does not meet difficulty 16: must be rejected.",
+      "expect" : "error",
+      "inputs" : {
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 16,
+        "solution_hex" : "0000000000000000"
+      },
+      "kind" : "pow",
+      "name" : "pow_insufficient",
+      "outputs" : {
+        "leading_zero_bits" : 0
+      }
+    },
+    {
+      "description" : "HTTP-428 error text the relay sends; the client extracts the JSON from the first '{' and decodes PowChallengeData.",
+      "expect" : "ok",
+      "inputs" : {
+        "message" : "proof-of-work required: {\"challenge\":\"QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE=\",\"difficulty\":16,\"timestamp\":1800000000}"
+      },
+      "kind" : "pow_challenge_message",
+      "name" : "pow_challenge_message",
+      "outputs" : {
+        "challenge_hex" : "42434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061",
+        "difficulty" : 16,
+        "timestamp" : 1800000000
+      }
+    }
+  ],
+  "verification" : "member_rejoin: production; host_auth/invite/pow: reference (private in WebSocketTransport)"
+}

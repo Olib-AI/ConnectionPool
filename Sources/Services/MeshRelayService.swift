@@ -132,6 +132,9 @@ public final class MeshRelayService: ObservableObject {
     /// Must be set before sending/receiving envelopes. Derived from a secret
     /// established during pool creation/joining — never transmitted on the wire.
     public var poolSharedSecret: SymmetricKey?
+
+    /// Per-origin wire-version memory. Enforces "once v2, never v1" for envelope integrity.
+    public let protocolLedger: PeerProtocolLedger
     
     // MARK: - Published State
     
@@ -140,6 +143,13 @@ public final class MeshRelayService: ObservableObject {
     
     /// Total count of messages dropped (loops, TTL, expiry, etc.).
     @Published public private(set) var droppedMessageCount: Int = 0
+
+    /// Origins whose envelopes arrived with only the v1 (StealthOS 1.4.x and older) MAC.
+    /// Drive the "this member uses an older, less secure version" indicator from this.
+    @Published public private(set) var legacyEnvelopeOrigins: Set<String> = []
+
+    /// Count of v1-only envelopes refused because their origin had already proven v2.
+    @Published public private(set) var downgradeRejectionCount: Int = 0
     
     // MARK: - Publishers
     
@@ -175,8 +185,9 @@ public final class MeshRelayService: ObservableObject {
     
     /// Creates a new mesh relay service.
     /// - Parameter localPeerID: The ID of the local peer in the mesh network.
-    public init(localPeerID: String) {
+    public init(localPeerID: String, protocolLedger: PeerProtocolLedger = PeerProtocolLedger()) {
         self.localPeerID = localPeerID
+        self.protocolLedger = protocolLedger
         self.topology = MeshTopology(localPeerID: localPeerID)
         self.deduplicationCache = MessageDeduplicationCache()
         // Note: Timers are started lazily in setPoolManager to avoid blocking
@@ -212,6 +223,7 @@ public final class MeshRelayService: ObservableObject {
         self.currentPoolID = nil
         self.poolSharedSecret = nil
         self.lastTopologyTimestamp = [:]
+        self.legacyEnvelopeOrigins = []
         stopTopologyBroadcastTimer()
     }
     
@@ -266,15 +278,11 @@ public final class MeshRelayService: ObservableObject {
             return false
         }
 
-        // Create relay envelope with HMAC integrity protection
-        let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID)
-        let envelope = RelayEnvelope(
-            originPeerID: localPeerID,
-            destinationPeerID: peerID,
-            hopPath: [localPeerID],
-            encryptedPayload: payload,
-            poolID: poolID
-        ).withHMAC(using: hmacKey)
+        // Create relay envelope signed for both v1 (1.4.x) and v2 (1.5.0+) receivers.
+        let envelope = Self.makeSignedEnvelope(
+            origin: localPeerID, destination: peerID, payload: payload,
+            poolID: poolID, sharedSecret: sharedSecret
+        )
 
         // Mark as processed to prevent echo
         deduplicationCache.markProcessed(envelope.messageID)
@@ -306,15 +314,11 @@ public final class MeshRelayService: ObservableObject {
             return
         }
 
-        // Create broadcast envelope (nil destination) with HMAC integrity protection
-        let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID)
-        let envelope = RelayEnvelope(
-            originPeerID: localPeerID,
-            destinationPeerID: nil,
-            hopPath: [localPeerID],
-            encryptedPayload: payload,
-            poolID: poolID
-        ).withHMAC(using: hmacKey)
+        // Create broadcast envelope (nil destination) signed for v1 and v2 receivers.
+        let envelope = Self.makeSignedEnvelope(
+            origin: localPeerID, destination: nil, payload: payload,
+            poolID: poolID, sharedSecret: sharedSecret
+        )
         
         // Mark as processed to prevent echo
         deduplicationCache.markProcessed(envelope.messageID)
@@ -373,9 +377,30 @@ public final class MeshRelayService: ObservableObject {
             return
         }
 
-        let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: currentPoolID)
-        guard envelope.verifyHMAC(using: hmacKey) else {
-            log("[SECURITY] Dropping envelope: HMAC verification failed (tampered metadata). messageID: \(envelope.messageID)",
+        switch envelope.verify(sharedSecret: sharedSecret, receiverPoolID: currentPoolID, ledger: protocolLedger) {
+        case .acceptedV2:
+            if legacyEnvelopeOrigins.contains(envelope.originPeerID) {
+                legacyEnvelopeOrigins.remove(envelope.originPeerID)
+            }
+        case .acceptedLegacy:
+            if !legacyEnvelopeOrigins.contains(envelope.originPeerID) {
+                log("[SECURITY] Accepting v1 envelope from \(envelope.originPeerID.prefix(8))... (StealthOS 1.4.x or older; payload not MAC-covered)",
+                    level: .warning, category: .network)
+                legacyEnvelopeOrigins.insert(envelope.originPeerID)
+            }
+        case .rejectedDowngrade:
+            log("[SECURITY] Dropping envelope: v1 envelope from origin \(envelope.originPeerID.prefix(8))... that already proved v2 (downgrade). messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            downgradeRejectionCount += 1
+            droppedMessageCount += 1
+            return
+        case .rejectedLegacy:
+            log("[SECURITY] Dropping v1 envelope (legacy peers refused by policy). messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            droppedMessageCount += 1
+            return
+        case .rejectedInvalid(let reason):
+            log("[SECURITY] Dropping envelope: \(reason). messageID: \(envelope.messageID)",
                 level: .warning, category: .network)
             droppedMessageCount += 1
             return
@@ -416,6 +441,30 @@ public final class MeshRelayService: ObservableObject {
         }
     }
     
+    /// Builds an origin envelope carrying both the v1 and the v2 MAC.
+    nonisolated static func makeSignedEnvelope(
+        origin: String,
+        destination: String?,
+        payload: Data,
+        poolID: UUID,
+        sharedSecret: SymmetricKey,
+        messageID: UUID = UUID(),
+        timestamp: Date = Date()
+    ) -> RelayEnvelope {
+        RelayEnvelope(
+            messageID: messageID,
+            originPeerID: origin,
+            destinationPeerID: destination,
+            hopPath: [origin],
+            encryptedPayload: payload,
+            poolID: poolID,
+            timestamp: timestamp
+        ).withDualHMAC(
+            v1Key: RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID),
+            v2Key: RelayEnvelope.deriveHMACKeyV2(from: sharedSecret, poolID: poolID)
+        )
+    }
+
     // MARK: - Loop Prevention
     
     /// Check if this envelope should be relayed to a specific peer.
@@ -513,6 +562,8 @@ public final class MeshRelayService: ObservableObject {
     public func peerDisconnected(_ peerID: String) {
         topology.removePeer(peerID)
         lastTopologyTimestamp.removeValue(forKey: peerID)
+        legacyEnvelopeOrigins.remove(peerID)
+        protocolLedger.peerDeparted(peerID)
         log("Peer disconnected from mesh: \(peerID.prefix(8))...", category: .network)
         
         // Broadcast topology update to neighbors

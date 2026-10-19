@@ -291,7 +291,13 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// When set, all outgoing messages are AES-GCM encrypted and incoming
     /// messages are decrypted before delivery to the delegate.
     /// Must be set after pool session establishment (host auth or join accepted).
-    public var poolSharedSecret: SymmetricKey?
+    public var poolSharedSecret: SymmetricKey? {
+        didSet {
+            // A new secret must never keep encrypting under the previous secret's key.
+            _cachedEncryptionKey = nil
+            _cachedEncryptionKeyPoolID = nil
+        }
+    }
 
     /// Cached AES-GCM encryption key derived from the pool shared secret.
     /// Invalidated when `poolSharedSecret` changes.
@@ -305,11 +311,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         if let cached = _cachedEncryptionKey, _cachedEncryptionKeyPoolID == pid {
             return cached
         }
-        let key = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: secret,
-            info: Data("stealth-ws-encrypt".utf8),
-            outputByteCount: 32
-        )
+        let key = WSOuterLayer.deriveKey(poolSharedSecret: secret)
         _cachedEncryptionKey = key
         _cachedEncryptionKeyPoolID = pid
         return key
@@ -325,12 +327,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     private func encryptForWS(_ plaintext: Data) -> Data? {
         guard let key = wsEncryptionKey() else { return plaintext }
         do {
-            let sealedBox = try AES.GCM.seal(plaintext, using: key)
-            guard let combined = sealedBox.combined else {
-                logMessage("[SECURITY] AES-GCM produced no combined box — dropping frame (fail-closed)")
-                return nil
-            }
-            return combined
+            return try WSOuterLayer.seal(plaintext, key: key)
         } catch {
             logMessage("[SECURITY] AES-GCM encryption failed: \(error.localizedDescription) — dropping frame (fail-closed)")
             return nil
@@ -346,14 +343,12 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             // No shared secret yet — pass through as-is (pre-session messages).
             return ciphertext
         }
-        do {
-            let sealedBox = try AES.GCM.SealedBox(combined: ciphertext)
-            return try AES.GCM.open(sealedBox, using: key)
-        } catch {
+        guard let plaintext = WSOuterLayer.open(ciphertext, key: key) else {
             // Decryption failed with a shared secret set — message is tampered.
             logMessage("[SECURITY] AES-GCM decryption failed, dropping message (tampered or malformed)")
             return nil
         }
+        return plaintext
     }
 
     // MARK: - Receive Loop
@@ -381,6 +376,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     }
 
     deinit {
+        powTask?.cancel()
         heartbeatTask?.cancel()
         reconnectTask?.cancel()
         receiveTask?.cancel()
@@ -700,6 +696,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
 
     /// Tear down the current connection without updating state.
     private func tearDown() {
+        powTask?.cancel()
+        powTask = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
         reconnectTask?.cancel()
@@ -875,19 +873,14 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
 
             // MUST match the Rust server's signature format:
             // "STEALTH_HOST_AUTH_V1:" || pool_id_raw_bytes (16) || timestamp_be (8) || nonce_raw
-            var signData = Data("STEALTH_HOST_AUTH_V1:".utf8)
-            let uuid = poolInfo.poolID
-            signData.append(contentsOf: withUnsafeBytes(of: uuid.uuid) { Data($0) })
-            signData.append(contentsOf: withUnsafeBytes(of: timestamp.bigEndian) { Data($0) })
-
-            // Append raw nonce bytes from the server-issued challenge for replay protection.
+            // Raw nonce bytes from the server-issued challenge bind the auth to this connection.
             guard let nonceData = Data(base64Encoded: nonce) else {
                 logMessage("[SECURITY] Cannot send HostAuth: invalid nonce encoding")
                 updateState(.failed(.authenticationFailed))
                 delegate?.transport(self, didFailWithError: .authenticationFailed)
                 return
             }
-            signData.append(nonceData)
+            let signData = RelayTranscripts.hostAuth(poolID: poolInfo.poolID, timestamp: timestamp, serverNonce: nonceData)
 
             let signature = try identity.sign(signData)
 
@@ -939,30 +932,12 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         var nonce = Data(count: 32)
         _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
 
-        // Derive verification key: HKDF-SHA256(ikm=tokenSecret, salt=poolId, info="STEALTH_INVITE_V1" || tokenId)
-        let poolIdBytes = withUnsafeBytes(of: invitation.poolId.uuid) { Data($0) }
-        let symmetricSecret = SymmetricKey(data: invitation.tokenSecret)
-
-        var info = Data("STEALTH_INVITE_V1".utf8)
-        info.append(invitation.tokenId)
-
-        let derivedKey = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: symmetricSecret,
-            salt: poolIdBytes,
-            info: info,
-            outputByteCount: 32
+        // vk = HKDF-SHA256(ikm=tokenSecret, salt=poolId, info="STEALTH_INVITE_V1" || tokenId)
+        // proof = HMAC-SHA256(vk, "JOIN" || poolId || timestamp || nonce)
+        let proof = RelayTranscripts.joinProof(
+            tokenSecret: invitation.tokenSecret, tokenID: invitation.tokenId,
+            poolID: invitation.poolId, timestamp: timestamp, nonce: nonce
         )
-
-        // Compute HMAC proof: HMAC-SHA256(key=vk, message="JOIN" || poolId || timestamp || nonce)
-        let vkData = derivedKey.withUnsafeBytes { Data($0) }
-        let hmacKey = SymmetricKey(data: vkData)
-        var message = Data("JOIN".utf8)
-        message.append(poolIdBytes)
-        message.append(contentsOf: withUnsafeBytes(of: timestamp.bigEndian) { Data($0) })
-        message.append(nonce)
-
-        let hmac = HMAC<SHA256>.authenticationCode(for: message, using: hmacKey)
-        let proof = Data(hmac)
 
         // SECURITY: Use the persistent member identity for this `(serverURL, poolID)`
         // so the public key the host approves is the same key the relay's
@@ -995,28 +970,10 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         var nonce = Data(count: 32)
         _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
 
-        let poolIdBytes = withUnsafeBytes(of: invitation.poolId.uuid) { Data($0) }
-        let symmetricSecret = SymmetricKey(data: invitation.tokenSecret)
-
-        var info = Data("STEALTH_INVITE_V1".utf8)
-        info.append(invitation.tokenId)
-
-        let derivedKey = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: symmetricSecret,
-            salt: poolIdBytes,
-            info: info,
-            outputByteCount: 32
+        let proof = RelayTranscripts.joinProof(
+            tokenSecret: invitation.tokenSecret, tokenID: invitation.tokenId,
+            poolID: invitation.poolId, timestamp: timestamp, nonce: nonce
         )
-
-        let vkData = derivedKey.withUnsafeBytes { Data($0) }
-        let hmacKey = SymmetricKey(data: vkData)
-        var message = Data("JOIN".utf8)
-        message.append(poolIdBytes)
-        message.append(contentsOf: withUnsafeBytes(of: timestamp.bigEndian) { Data($0) })
-        message.append(nonce)
-
-        let hmac = HMAC<SHA256>.authenticationCode(for: message, using: hmacKey)
-        let proof = Data(hmac)
 
         // Same persistent identity as the pre-PoW path — see `sendJoinRequest`.
         let identity: RemoteMemberIdentity
@@ -1156,65 +1113,21 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         disconnect()
     }
 
-    // MARK: - Proof-of-Work Solver
+    // MARK: - Proof-of-Work
 
-    /// Parsed PoW challenge extracted from a server error message.
-    private struct ParsedPowChallenge {
-        let challengeBytes: Data
-        let challengeBase64: String
-        let difficulty: UInt8
-    }
+    /// Background PoW search, cancelled on tear-down so a disconnect never leaves a
+    /// core spinning.
+    private var powTask: Task<Void, Never>?
 
-    /// Parse a PoW challenge from the server's error message.
-    /// Format: "proof-of-work required: {"challenge":"<base64>","difficulty":<n>,"timestamp":<t>}"
-    nonisolated private static func parsePowChallenge(from message: String) -> ParsedPowChallenge? {
-        guard let jsonStart = message.range(of: "{") else { return nil }
-        let jsonString = String(message[jsonStart.lowerBound...])
-        guard let jsonData = jsonString.data(using: .utf8),
-              let parsed = try? JSONDecoder().decode(PowChallengeData.self, from: jsonData),
-              let challengeBytes = Data(base64Encoded: parsed.challenge) else {
-            return nil
-        }
-        return ParsedPowChallenge(
-            challengeBytes: challengeBytes,
-            challengeBase64: parsed.challenge,
-            difficulty: parsed.difficulty
-        )
-    }
-
-    /// Solve a PoW challenge by brute-force SHA-256 search.
-    /// Finds a nonce such that SHA-256("STEALTH_POW" || challenge || nonce) has `difficulty` leading zero bits.
-    /// This is CPU-intensive — call from a background thread.
-    nonisolated private static func solvePoW(challenge: Data, difficulty: UInt8) -> [UInt8] {
-        let prefix = Data("STEALTH_POW".utf8)
-        var nonce: UInt64 = 0
-
-        while true {
-            let nonceBytes = withUnsafeBytes(of: nonce.bigEndian) { Data($0) }
-            var input = prefix
-            input.append(challenge)
-            input.append(nonceBytes)
-
-            let hash = SHA256.hash(data: input)
-            if Self.leadingZeroBits(Array(hash)) >= UInt32(difficulty) {
-                return Array(nonceBytes)
-            }
-            nonce &+= 1
-        }
-    }
-
-    /// Count leading zero bits in a byte array.
-    nonisolated private static func leadingZeroBits(_ bytes: [UInt8]) -> UInt32 {
-        var count: UInt32 = 0
-        for byte in bytes {
-            if byte == 0 {
-                count += 8
-            } else {
-                count += UInt32(byte.leadingZeroBitCount)
-                break
-            }
-        }
-        return count
+    /// Fails the connection after a PoW problem the user cannot fix by waiting.
+    private func failPoW(_ failure: ProofOfWork.Failure) {
+        logMessage("[SECURITY] Proof-of-work refused: \(failure.description)")
+        powRetryInProgress = false
+        intentionalDisconnect = true
+        let error = TransportError.underlying(WrappedError(message: failure.description))
+        tearDown()
+        updateState(.failed(error))
+        delegate?.transport(self, didFailWithError: error)
     }
 
     // MARK: - Internal: Receive Loop
@@ -1454,27 +1367,42 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             if data.code == 428, !powRetryInProgress, let invitation = joinInvitation {
                 logMessage("PoW challenge received, solving...")
                 powRetryInProgress = true
-                if let challenge = Self.parsePowChallenge(from: data.message) {
-                    let challengeBytes = challenge.challengeBytes
-                    let challengeBase64 = challenge.challengeBase64
-                    let difficulty = challenge.difficulty
-                    Task.detached(priority: .userInitiated) {
-                        let solution = WebSocketTransport.solvePoW(challenge: challengeBytes, difficulty: difficulty)
-                        let solutionData = PowSolutionData(
-                            challenge: challengeBase64,
-                            solution: Data(solution).base64EncodedString()
-                        )
+                switch ProofOfWork.parse(message: data.message) {
+                case .success(let challenge):
+                    let deadline = ContinuousClock.now.advanced(by: ProofOfWork.defaultTimeBudget)
+                    powTask?.cancel()
+                    powTask = Task.detached(priority: .userInitiated) { [weak self] in
+                        let outcome: Result<[UInt8], ProofOfWork.Failure>
+                        do throws(ProofOfWork.Failure) {
+                            outcome = .success(try ProofOfWork.solve(
+                                challenge: challenge.bytes, difficulty: challenge.difficulty, deadline: deadline
+                            ))
+                        } catch {
+                            outcome = .failure(error)
+                        }
                         await MainActor.run { [weak self] in
                             guard let self else { return }
-                            self.logMessage("PoW solved, resubmitting join request")
-                            self.sendJoinRequestWithPoW(invitation: invitation, powSolution: solutionData)
-                            self.powRetryInProgress = false
+                            self.powTask = nil
+                            switch outcome {
+                            case .success(let solution):
+                                self.logMessage("PoW solved, resubmitting join request")
+                                self.sendJoinRequestWithPoW(
+                                    invitation: invitation,
+                                    powSolution: PowSolutionData(
+                                        challenge: challenge.base64,
+                                        solution: Data(solution).base64EncodedString()
+                                    )
+                                )
+                                self.powRetryInProgress = false
+                            case .failure(.cancelled):
+                                self.powRetryInProgress = false
+                            case .failure(let failure):
+                                self.failPoW(failure)
+                            }
                         }
                     }
-                } else {
-                    powRetryInProgress = false
-                    delegate?.transport(self, didFailWithError: .from(NSError(domain: "ServerFrame", code: 428,
-                                                                              userInfo: [NSLocalizedDescriptionKey: "Failed to parse PoW challenge"])))
+                case .failure(let failure):
+                    failPoW(failure)
                 }
                 return
             }

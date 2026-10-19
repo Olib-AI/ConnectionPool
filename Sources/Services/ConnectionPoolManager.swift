@@ -254,6 +254,11 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Initialized lazily after peerID is set up so we have the local peer identifier.
     private var meshRelayService: MeshRelayService?
 
+    /// Per-peer wire-version memory shared by every relay and call component that runs on
+    /// top of this manager. Lives as long as the manager, so a peer that has proven it
+    /// speaks v2 (StealthOS 1.5.0+) can never be downgraded to v1 for the rest of the run.
+    public let wireProtocolLedger = PeerProtocolLedger()
+
     /// Tracked delayed tasks so they can be cancelled on disconnect.
     /// Completed tasks are automatically removed via `trackDelayedTask(_:)`.
     private var delayedTasks: [UUID: Task<Void, Never>] = [:]
@@ -407,7 +412,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Creates and wires the MeshRelayService after peerID is available.
     private func setupMeshRelayService() {
         guard peerID != nil else { return }
-        let service = MeshRelayService(localPeerID: localPeerID)
+        let service = MeshRelayService(localPeerID: localPeerID, protocolLedger: wireProtocolLedger)
         service.setPoolManager(self)
         meshRelayService = service
     }
