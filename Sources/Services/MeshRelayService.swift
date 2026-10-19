@@ -135,6 +135,9 @@ public final class MeshRelayService: ObservableObject {
 
     /// Per-origin wire-version memory. Enforces "once v2, never v1" for envelope integrity.
     public let protocolLedger: PeerProtocolLedger
+
+    /// Per-session Ed25519 keys: ours for signing, peers' for verifying origins.
+    public let signingKeys: EnvelopeSigningKeys
     
     // MARK: - Published State
     
@@ -150,6 +153,22 @@ public final class MeshRelayService: ObservableObject {
 
     /// Count of v1-only envelopes refused because their origin had already proven v2.
     @Published public private(set) var downgradeRejectionCount: Int = 0
+
+    /// A message addressed to us (or broadcast) that was refused because a relay on an
+    /// older StealthOS version stripped its v2 protection. The content is never delivered;
+    /// tell the user it existed.
+    public struct UnverifiableRelayedMessage: Sendable, Equatable {
+        public let originPeerID: String
+        public let messageID: UUID
+        public let wasBroadcast: Bool
+    }
+
+    /// Emits at most one notice per origin per ``unverifiableNoticeInterval``.
+    public let unverifiableRelayedMessage = PassthroughSubject<UnverifiableRelayedMessage, Never>()
+
+    /// Minimum spacing between notices for the same origin (seconds).
+    public static let unverifiableNoticeInterval: TimeInterval = 60
+    private var lastUnverifiableNotice: [String: Date] = [:]
     
     // MARK: - Publishers
     
@@ -185,9 +204,14 @@ public final class MeshRelayService: ObservableObject {
     
     /// Creates a new mesh relay service.
     /// - Parameter localPeerID: The ID of the local peer in the mesh network.
-    public init(localPeerID: String, protocolLedger: PeerProtocolLedger = PeerProtocolLedger()) {
+    public init(
+        localPeerID: String,
+        protocolLedger: PeerProtocolLedger = PeerProtocolLedger(),
+        signingKeys: EnvelopeSigningKeys = EnvelopeSigningKeys()
+    ) {
         self.localPeerID = localPeerID
         self.protocolLedger = protocolLedger
+        self.signingKeys = signingKeys
         self.topology = MeshTopology(localPeerID: localPeerID)
         self.deduplicationCache = MessageDeduplicationCache()
         // Note: Timers are started lazily in setPoolManager to avoid blocking
@@ -224,6 +248,7 @@ public final class MeshRelayService: ObservableObject {
         self.poolSharedSecret = nil
         self.lastTopologyTimestamp = [:]
         self.legacyEnvelopeOrigins = []
+        self.lastUnverifiableNotice = [:]
         stopTopologyBroadcastTimer()
     }
     
@@ -281,7 +306,7 @@ public final class MeshRelayService: ObservableObject {
         // Create relay envelope signed for both v1 (1.4.x) and v2 (1.5.0+) receivers.
         let envelope = Self.makeSignedEnvelope(
             origin: localPeerID, destination: peerID, payload: payload,
-            poolID: poolID, sharedSecret: sharedSecret
+            poolID: poolID, sharedSecret: sharedSecret, signer: signingKeys
         )
 
         // Mark as processed to prevent echo
@@ -317,7 +342,7 @@ public final class MeshRelayService: ObservableObject {
         // Create broadcast envelope (nil destination) signed for v1 and v2 receivers.
         let envelope = Self.makeSignedEnvelope(
             origin: localPeerID, destination: nil, payload: payload,
-            poolID: poolID, sharedSecret: sharedSecret
+            poolID: poolID, sharedSecret: sharedSecret, signer: signingKeys
         )
         
         // Mark as processed to prevent echo
@@ -377,7 +402,9 @@ public final class MeshRelayService: ObservableObject {
             return
         }
 
-        switch envelope.verify(sharedSecret: sharedSecret, receiverPoolID: currentPoolID, ledger: protocolLedger) {
+        let verdict = envelope.verify(sharedSecret: sharedSecret, receiverPoolID: currentPoolID,
+                                      ledger: protocolLedger, signers: signingKeys)
+        switch verdict {
         case .acceptedV2:
             if legacyEnvelopeOrigins.contains(envelope.originPeerID) {
                 legacyEnvelopeOrigins.remove(envelope.originPeerID)
@@ -388,11 +415,15 @@ public final class MeshRelayService: ObservableObject {
                     level: .warning, category: .network)
                 legacyEnvelopeOrigins.insert(envelope.originPeerID)
             }
+        case .relayOnlyUnknownSigner:
+            log("[RELAY] Envelope from \(envelope.originPeerID.prefix(8))... has no known signing key here; forwarding only. messageID: \(envelope.messageID)",
+                level: .debug, category: .network)
         case .rejectedDowngrade:
-            log("[SECURITY] Dropping envelope: v1 envelope from origin \(envelope.originPeerID.prefix(8))... that already proved v2 (downgrade). messageID: \(envelope.messageID)",
+            log("[SECURITY] Dropping envelope: v1 envelope from origin \(envelope.originPeerID.prefix(8))... that already proved v2 (stripped by a 1.4.x relay, or a downgrade attack). messageID: \(envelope.messageID)",
                 level: .warning, category: .network)
             downgradeRejectionCount += 1
             droppedMessageCount += 1
+            noteUnverifiableMessage(envelope)
             return
         case .rejectedLegacy:
             log("[SECURITY] Dropping v1 envelope (legacy peers refused by policy). messageID: \(envelope.messageID)",
@@ -423,10 +454,17 @@ public final class MeshRelayService: ObservableObject {
             return
         }
         
-        // Check if we are the destination or it's a broadcast
+        // Check if we are the destination or it's a broadcast. Only authenticated
+        // origins are delivered; unknown signers are forwarded at most.
         let isForUs = envelope.isIntendedFor(localPeerID)
-        
-        if isForUs {
+
+        if isForUs && !verdict.isAccepted {
+            log("[SECURITY] Not delivering envelope from \(envelope.originPeerID.prefix(8))...: origin signing key unknown. messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            droppedMessageCount += 1
+        }
+
+        if isForUs && verdict.isAccepted {
             // Deliver locally
             log("Received envelope for local peer, origin: \(envelope.originPeerID.prefix(8))...", category: .network)
             receivedEnvelope.send(envelope)
@@ -441,13 +479,31 @@ public final class MeshRelayService: ObservableObject {
         }
     }
     
-    /// Builds an origin envelope carrying both the v1 and the v2 MAC.
+    /// Tells the UI (throttled per origin) that a message could not be verified because a
+    /// 1.4.x relay stripped its v2 protection. Only for envelopes addressed to us.
+    private func noteUnverifiableMessage(_ envelope: RelayEnvelope) {
+        guard envelope.isIntendedFor(localPeerID), envelope.originPeerID != localPeerID else { return }
+        let now = Date()
+        if let last = lastUnverifiableNotice[envelope.originPeerID],
+           now.timeIntervalSince(last) < Self.unverifiableNoticeInterval {
+            return
+        }
+        lastUnverifiableNotice[envelope.originPeerID] = now
+        unverifiableRelayedMessage.send(UnverifiableRelayedMessage(
+            originPeerID: envelope.originPeerID,
+            messageID: envelope.messageID,
+            wasBroadcast: envelope.isBroadcast
+        ))
+    }
+
+    /// Builds an origin envelope carrying the v1 MAC, the v2 MAC and the origin signature.
     nonisolated static func makeSignedEnvelope(
         origin: String,
         destination: String?,
         payload: Data,
         poolID: UUID,
         sharedSecret: SymmetricKey,
+        signer: EnvelopeSigningKeys,
         messageID: UUID = UUID(),
         timestamp: Date = Date()
     ) -> RelayEnvelope {
@@ -459,9 +515,10 @@ public final class MeshRelayService: ObservableObject {
             encryptedPayload: payload,
             poolID: poolID,
             timestamp: timestamp
-        ).withDualHMAC(
+        ).signedForV2(
             v1Key: RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID),
-            v2Key: RelayEnvelope.deriveHMACKeyV2(from: sharedSecret, poolID: poolID)
+            v2Key: RelayEnvelope.deriveHMACKeyV2(from: sharedSecret, poolID: poolID),
+            signer: signer
         )
     }
 
@@ -563,7 +620,11 @@ public final class MeshRelayService: ObservableObject {
         topology.removePeer(peerID)
         lastTopologyTimestamp.removeValue(forKey: peerID)
         legacyEnvelopeOrigins.remove(peerID)
+        lastUnverifiableNotice.removeValue(forKey: peerID)
         protocolLedger.peerDeparted(peerID)
+        // The direct, transport-authenticated link is gone: the peer may rejoin with a
+        // fresh E2E session and signing key.
+        signingKeys.forget(peerID: peerID)
         log("Peer disconnected from mesh: \(peerID.prefix(8))...", category: .network)
         
         // Broadcast topology update to neighbors

@@ -63,13 +63,24 @@ u64 IEEE-754 bits of the JSON timestamp (seconds since 2001)
 u64 len || encryptedPayload
 ```
 
-New JSON keys: `envelopeVersion` (2), `originTTL`, `envelopeHMACV2`. A 1.5.0 origin attaches **both** MACs, so 1.4.x relays and receivers keep working. 1.5.0 receivers verify only the v2 MAC whenever any v2 key is present, so stripping or corrupting part of v2 never falls back to v1.
+New JSON keys: `envelopeVersion` (2), `originTTL`, `envelopeHMACV2`, `originSignature`. A 1.5.0 origin attaches **both** MACs, so 1.4.x relays and receivers keep working. 1.5.0 receivers verify only the v2 MAC whenever any v2 key is present, so stripping or corrupting part of v2 never falls back to v1.
 
 The per-hop `ttl` and `hopPath` cannot be MAC'd by the origin. v2 binds `originTTL` instead and enforces `1 <= ttl <= originTTL <= 5`, `hopPath[0] == originPeerID` and `hopPath.count + ttl == originTTL + 1`: a relay can never grant more hops than the origin did. Timestamps more than 120 s in the future are rejected so an envelope cannot outlive the deduplication cache.
 
 **Downgrade rule.** `PeerProtocolLedger` (shared through `ConnectionPoolManager.wireProtocolLedger`) remembers every origin that has sent a valid v2 envelope. A v1-only envelope from such an origin is refused for the rest of the session. A v1-only envelope from an origin never seen with v2 is accepted under the default `LegacyPeerPolicy.warn` and the origin is published in `MeshRelayService.legacyEnvelopeOrigins` for an "older, less secure version" indicator. Set the ledger's policy to `.refuse` to drop v1 entirely.
 
-The pool-wide key means any pool member can still produce valid MACs; the MAC protects against relays and observers that do not hold the pool secret. Golden vectors: `Tests/ConnectionPoolTests/Golden/relay_envelope_hmac_v2.json`.
+**Per-sender authenticity.** The pool MAC only proves "a member of this pool": any member could forge any origin. v2 therefore also carries `originSignature`, an Ed25519 signature by the origin over exactly the v2 MAC input, made with a per-session signing key (`EnvelopeSigningKeys`).
+
+- The key travels in the E2E key exchange (`KeyExchangePayload.signingPublicKey`) with `signingKeyBinding`, a signature by that key over `u32 len || "STEALTH_ENVELOPE_SIGNING_KEY_V2" || u32 len || peerID || poolID (16) || X25519 key (32) || Ed25519 key (32)`. The signing key is thereby tied to the peer ID, the pool and the peer's E2E key, so verifying the E2E fingerprint out of band also authenticates it.
+- Receivers keep the first valid key per peer for the session (TOFU). A different key for the same peer is refused and reported (`EnvelopeSigningKeys.events`) until the peer's direct, transport-authenticated connection drops or the pool session ends; a new session rotates our own key.
+- Verification order: pool MAC (cheap filter), routing invariants, then the signature. A missing or invalid signature is rejected. If this node has no key for the origin (it never exchanged keys with it) the envelope may be forwarded but is never delivered.
+- The signature covers the pool ID, so a member of another pool cannot replay it even after re-MACing.
+
+The pool MAC key comes from `PoolIntegritySecret`: `SHA-256(pool code)`, the one secret every member of a local pool shares (the host generates the code, joiners type it). This is the derivation 1.4.x already used. Pools without a code, and remote pools, have no pool-wide secret, so mesh relaying is disabled for them rather than run on a made-up key. Feature packages must use `ConnectionPoolManager.meshRelay` instead of creating their own `MeshRelayService`.
+
+**Stripped by a 1.4.x relay.** A 1.4.x relay drops the v2 fields when it re-encodes an envelope. If the origin has already proven v2, the stripped copy is refused (fail closed). When it was addressed to us, `MeshRelayService.unverifiableRelayedMessage` reports it (at most once a minute per origin) so the app can tell the user a message from that peer could not be verified. The content is never delivered.
+
+Golden vectors: `Tests/ConnectionPoolTests/Golden/relay_envelope_hmac_v2.json` (generated independently by `generate_relay_envelope_hmac_v2.py`).
 
 ## Loop and Amplification Prevention
 

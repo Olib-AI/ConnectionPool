@@ -34,6 +34,10 @@ import CryptoKit
 //                                                      "timestamp" number (seconds since 2001)
 //   u64 len || encryptedPayload
 //
+// originSignature = Ed25519 by the origin's per-session signing key (EnvelopeSigningKeys)
+// over exactly the bytes above. The pool MAC filters non-members cheaply; the signature
+// stops one member from forging another member's origin.
+//
 // Key: HKDF-SHA256(ikm = pool shared secret,
 //                  salt = poolID(16) || "StealthOS-RelayEnvelope-HMAC-Salt",
 //                  info = "envelope-integrity-v2", 32).
@@ -105,19 +109,27 @@ extension RelayEnvelope {
 
     /// Whether this envelope claims to be v2 (carries any v2 field).
     public var claimsV2: Bool {
-        envelopeVersion != nil || envelopeHMACV2 != nil || originTTL != nil
+        envelopeVersion != nil || envelopeHMACV2 != nil || originTTL != nil || originSignature != nil
     }
 
-    /// Returns a copy signed for both v1 and v2 receivers.
+    /// Returns a copy carrying the v1 MAC (for 1.4.x peers), the v2 pool MAC and the
+    /// origin's Ed25519 signature over the v2 input.
     ///
     /// `originTTL` is set to the envelope's current `ttl`; call this on the origin only.
-    public func withDualHMAC(v1Key: SymmetricKey, v2Key: SymmetricKey) -> RelayEnvelope {
+    public func signedForV2(v1Key: SymmetricKey, v2Key: SymmetricKey, signer: EnvelopeSigningKeys) -> RelayEnvelope {
         var copy = self
         copy.envelopeHMAC = computeHMAC(using: v1Key)
         copy.envelopeVersion = Self.currentEnvelopeVersion
         copy.originTTL = ttl
         copy.envelopeHMACV2 = copy.computeHMACV2(using: v2Key)
+        copy.originSignature = copy.hmacInputV2().flatMap { signer.sign($0) }
         return copy
+    }
+
+    /// Verifies ``originSignature`` against `key`.
+    public func verifyOriginSignature(using key: Curve25519.Signing.PublicKey) -> Bool {
+        guard let signature = originSignature, signature.count == 64, let input = hmacInputV2() else { return false }
+        return key.isValidSignature(signature, for: input)
     }
 
     /// Routing invariants that v2 receivers enforce after the MAC verifies.
@@ -150,12 +162,16 @@ extension RelayEnvelope {
 
 // MARK: - Inbound Verification
 
-/// Result of verifying an inbound envelope against the pool key and the downgrade ledger.
+/// Result of verifying an inbound envelope against the pool key, the origin's signing
+/// key and the downgrade ledger.
 public enum RelayEnvelopeVerdict: Sendable, Equatable {
-    /// v2 MAC and routing invariants verified.
+    /// v2 MAC, routing invariants and the origin's signature verified.
     case acceptedV2
     /// v1-only envelope from an origin never seen speaking v2 (legacy policy: warn).
     case acceptedLegacy
+    /// v2 MAC and invariants verified, but this node has no signing key for the origin
+    /// (it never exchanged keys with it). Safe to forward; never deliver.
+    case relayOnlyUnknownSigner
     /// The envelope failed authentication or a v2 routing invariant.
     case rejectedInvalid(reason: String)
     /// v1-only envelope from an origin that has been seen speaking v2.
@@ -163,8 +179,14 @@ public enum RelayEnvelopeVerdict: Sendable, Equatable {
     /// v1-only envelope and the legacy policy is ``LegacyPeerPolicy/refuse``.
     case rejectedLegacy
 
+    /// Whether the payload may be delivered to the local user.
     public var isAccepted: Bool {
         self == .acceptedV2 || self == .acceptedLegacy
+    }
+
+    /// Whether the envelope may be forwarded to other peers.
+    public var mayForward: Bool {
+        isAccepted || self == .relayOnlyUnknownSigner
     }
 }
 
@@ -172,15 +194,17 @@ extension RelayEnvelope {
 
     /// Full inbound integrity decision for a receiver or relay.
     ///
-    /// - v2 fields present: the v2 MAC and routing invariants must verify. A v2 envelope
-    ///   is never downgraded to v1 verification, so stripping or corrupting only the v2
-    ///   tag fails closed.
+    /// - v2 fields present: the v2 pool MAC (cheap filter), the routing invariants and the
+    ///   origin's Ed25519 signature must verify. A v2 envelope is never downgraded to v1
+    ///   verification, so stripping or corrupting part of v2 fails closed. If this node has
+    ///   no signing key for the origin, the verdict is ``RelayEnvelopeVerdict/relayOnlyUnknownSigner``.
     /// - v2 fields absent: the v1 MAC must verify and the ledger decides (refuses origins
     ///   pinned to v2, and applies the legacy policy otherwise).
     public func verify(
         sharedSecret: SymmetricKey,
         receiverPoolID: UUID,
         ledger: PeerProtocolLedger,
+        signers: EnvelopeSigningKeys,
         now: Date = Date()
     ) -> RelayEnvelopeVerdict {
         if isFromTheFuture(now: now) {
@@ -193,6 +217,15 @@ extension RelayEnvelope {
             }
             guard verifyV2RoutingInvariants() else {
                 return .rejectedInvalid(reason: "v2 TTL / hop path invariant violated")
+            }
+            guard let signature = originSignature, signature.count == 64 else {
+                return .rejectedInvalid(reason: "v2 origin signature missing")
+            }
+            guard let signingKey = signers.signingKey(for: originPeerID) else {
+                return .relayOnlyUnknownSigner
+            }
+            guard verifyOriginSignature(using: signingKey) else {
+                return .rejectedInvalid(reason: "v2 origin signature invalid")
             }
             _ = ledger.admit(peerID: originPeerID, feature: .relayEnvelope, version: 2)
             return .acceptedV2

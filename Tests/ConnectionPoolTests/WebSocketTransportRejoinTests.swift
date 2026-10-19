@@ -15,6 +15,12 @@ import CryptoKit
 @MainActor
 final class WebSocketTransportRejoinTests: XCTestCase {
 
+    override func setUp() async throws {
+        try await super.setUp()
+        // Unsigned SPM test bundles have no Keychain entitlement (-34018).
+        InMemorySecureItemStore.install()
+    }
+
     private let serverURLString = "wss://rejoin-test.example/ws"
 
     // Async tearDown inherits the class's @MainActor isolation.

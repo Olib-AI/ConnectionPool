@@ -154,12 +154,13 @@ struct GoldenV1ProductionTests {
         #expect(decoded.verifyHMAC(using: key))
         #expect(decoded.computeHMAC(using: key) == (try v.outputHex("hmac_hex")))
         // A 1.5.0 origin still emits the same v1 tag next to the v2 tag.
-        let dual = decoded.withDualHMAC(v1Key: key, v2Key: RelayEnvelope.deriveHMACKeyV2(from: SymmetricKey(data: try v.inputHex("shared_secret_hex")), poolID: decoded.poolID))
+        let dual = decoded.signedForV2(v1Key: key, v2Key: RelayEnvelope.deriveHMACKeyV2(from: SymmetricKey(data: try v.inputHex("shared_secret_hex")), poolID: decoded.poolID),
+                                       signer: EnvelopeSigningKeys())
         #expect(dual.envelopeHMAC == (try v.outputHex("hmac_hex")))
         // And re-encoding a v1 envelope adds no keys (1.4.x JSON shape preserved).
         let json = try #require(decoded.encode())
         let object = try #require(try JSONSerialization.jsonObject(with: json) as? [String: Any])
-        #expect(object["envelopeVersion"] == nil && object["originTTL"] == nil && object["envelopeHMACV2"] == nil)
+        #expect(object["envelopeVersion"] == nil && object["originTTL"] == nil && object["envelopeHMACV2"] == nil && object["originSignature"] == nil)
     }
 
     @Test("v1 tamper vectors keep their frozen v1 verdicts", arguments: Golden.vectors("relay_envelope_hmac.json", kind: "envelope_tamper"))
@@ -179,6 +180,6 @@ struct GoldenV1ProductionTests {
         let ledger = PeerProtocolLedger()
         ledger.observe(peerID: decoded.originPeerID, feature: .relayEnvelope, advertisedVersions: [1, 2])
         let now = decoded.timestamp.addingTimeInterval(1)
-        #expect(decoded.verify(sharedSecret: secret, receiverPoolID: pool, ledger: ledger, now: now) == .rejectedDowngrade)
+        #expect(decoded.verify(sharedSecret: secret, receiverPoolID: pool, ledger: ledger, signers: EnvelopeSigningKeys(), now: now) == .rejectedDowngrade)
     }
 }

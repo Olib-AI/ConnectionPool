@@ -145,9 +145,16 @@ public struct PoolMessage: Identifiable, Codable, Sendable {
     public static func keyExchange(
         from senderID: String,
         senderName: String,
-        publicKey: Data
+        publicKey: Data,
+        signingPublicKey: Data? = nil,
+        signingKeyBinding: Data? = nil
     ) -> PoolMessage {
-        let payload = KeyExchangePayload(publicKey: publicKey, senderPeerID: senderID)
+        let payload = KeyExchangePayload(
+            publicKey: publicKey,
+            senderPeerID: senderID,
+            signingPublicKey: signingPublicKey,
+            signingKeyBinding: signingKeyBinding
+        )
         let payloadData = (try? JSONEncoder().encode(payload)) ?? Data()
         return PoolMessage(
             type: .keyExchange,
@@ -281,10 +288,19 @@ public struct ProfileUpdatePayload: Codable, Sendable {
 public struct KeyExchangePayload: Codable, Sendable {
     public let publicKey: Data
     public let senderPeerID: String
+    /// Ed25519 envelope-signing key for this session (StealthOS 1.5.0+; absent from 1.4.x,
+    /// whose decoders ignore it). See ``EnvelopeSigningKeys``.
+    public let signingPublicKey: Data?
+    /// Signature by `signingPublicKey` over
+    /// ``EnvelopeSigningKeys/bindingStatement(peerID:poolID:keyAgreementPublicKey:signingPublicKey:)``,
+    /// tying it to `senderPeerID`, the pool and `publicKey`.
+    public let signingKeyBinding: Data?
 
-    public init(publicKey: Data, senderPeerID: String) {
+    public init(publicKey: Data, senderPeerID: String, signingPublicKey: Data? = nil, signingKeyBinding: Data? = nil) {
         self.publicKey = publicKey
         self.senderPeerID = senderPeerID
+        self.signingPublicKey = signingPublicKey
+        self.signingKeyBinding = signingKeyBinding
     }
 }
 

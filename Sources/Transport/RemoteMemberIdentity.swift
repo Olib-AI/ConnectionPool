@@ -17,7 +17,6 @@
 
 import Foundation
 import CryptoKit
-import Security
 
 // MARK: - Remote Member Identity
 
@@ -140,60 +139,29 @@ public struct RemoteMemberIdentity: Sendable {
         return "\(keychainAccountPrefix)\(hex)"
     }
 
-    // MARK: - Private Keychain Helpers
+    // MARK: - Private Store Helpers
 
     private static func saveToKeychain(_ data: Data, account: String) throws {
-        // Delete any existing slot first so SecItemAdd doesn't fail with errSecDuplicateItem.
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        ]
-
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw RemoteMemberIdentityError.keychainFailure(status: status, operation: "save")
+        do {
+            try SecureItemStorage.shared.store.save(data, service: keychainService, account: account)
+        } catch let error as SecureItemStoreError {
+            throw RemoteMemberIdentityError.keychainFailure(status: error.status, operation: error.operation)
         }
     }
 
     private static func loadFromKeychain(account: String) throws -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        switch status {
-        case errSecSuccess:
-            return result as? Data
-        case errSecItemNotFound:
-            return nil
-        default:
-            throw RemoteMemberIdentityError.keychainFailure(status: status, operation: "load")
+        do {
+            return try SecureItemStorage.shared.store.load(service: keychainService, account: account)
+        } catch let error as SecureItemStoreError {
+            throw RemoteMemberIdentityError.keychainFailure(status: error.status, operation: error.operation)
         }
     }
 
     private static func deleteFromKeychain(account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: account,
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw RemoteMemberIdentityError.keychainFailure(status: status, operation: "delete")
+        do {
+            try SecureItemStorage.shared.store.delete(service: keychainService, account: account)
+        } catch let error as SecureItemStoreError {
+            throw RemoteMemberIdentityError.keychainFailure(status: error.status, operation: error.operation)
         }
     }
 }

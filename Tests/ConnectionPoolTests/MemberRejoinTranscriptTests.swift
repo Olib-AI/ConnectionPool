@@ -11,6 +11,12 @@ import CryptoKit
 
 final class MemberRejoinTranscriptTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // Unsigned SPM test bundles have no Keychain entitlement (-34018).
+        InMemorySecureItemStore.install()
+    }
+
     // MARK: - Fixed vectors
 
     /// Hand-built reference transcript using fully deterministic inputs so the

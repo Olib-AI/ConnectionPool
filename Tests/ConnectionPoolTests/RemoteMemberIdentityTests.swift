@@ -10,6 +10,12 @@ import CryptoKit
 
 final class RemoteMemberIdentityTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // Unsigned SPM test bundles have no Keychain entitlement (-34018).
+        InMemorySecureItemStore.install()
+    }
+
     // Distinct per-test fixtures so parallel runs don't clobber each other's
     // Keychain slots. We always tear down by calling `delete` in the trailing
     // `tearDown` regardless of whether the test created the slot.

@@ -259,6 +259,20 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// speaks v2 (StealthOS 1.5.0+) can never be downgraded to v1 for the rest of the run.
     public let wireProtocolLedger = PeerProtocolLedger()
 
+    /// Per-session Ed25519 envelope-signing keys (ours and our peers'). Advertise
+    /// ``EnvelopeSigningKeys/localPublicKey`` in every E2E key exchange and register the
+    /// peer's key on receipt; the relay service uses it for per-sender authenticity.
+    public let envelopeSigningKeys = EnvelopeSigningKeys()
+
+    /// The pool-wide relay integrity secret, derived from the pool code (see
+    /// ``PoolIntegritySecret``). `nil` for pools without a code and remote pools.
+    public private(set) var poolIntegritySecret: SymmetricKey?
+
+    /// The single mesh relay service for this manager. Feature packages (Pool Chat) must
+    /// use this instance rather than creating their own, so every `.relay` message is
+    /// verified and forwarded exactly once with the pool's real secret.
+    public var meshRelay: MeshRelayService? { meshRelayService }
+
     /// Tracked delayed tasks so they can be cancelled on disconnect.
     /// Completed tasks are automatically removed via `trackDelayedTask(_:)`.
     private var delayedTasks: [UUID: Task<Void, Never>] = [:]
@@ -409,10 +423,21 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         setupMeshRelayService()
     }
 
+    /// Points a relay service at a pool and gives it the pool's integrity secret. Every
+    /// member derives the same secret from the same pool code. Returns the secret.
+    @discardableResult
+    static func configureRelay(_ relay: MeshRelayService?, poolID: UUID, poolCode: String?) -> SymmetricKey? {
+        let secret = PoolIntegritySecret.derive(poolCode: poolCode)
+        relay?.setCurrentPool(poolID)
+        relay?.poolSharedSecret = secret
+        return secret
+    }
+
     /// Creates and wires the MeshRelayService after peerID is available.
     private func setupMeshRelayService() {
         guard peerID != nil else { return }
-        let service = MeshRelayService(localPeerID: localPeerID, protocolLedger: wireProtocolLedger)
+        let service = MeshRelayService(localPeerID: localPeerID, protocolLedger: wireProtocolLedger,
+                                       signingKeys: envelopeSigningKeys)
         service.setPoolManager(self)
         meshRelayService = service
     }
@@ -685,12 +710,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // Wire mesh relay service with pool context
         if let session = currentSession {
-            meshRelayService?.setCurrentPool(session.id)
-            // Derive symmetric key from pool code (shared secret between all members)
-            if let code = session.poolCode {
-                let keyData = SHA256.hash(data: Data(code.utf8))
-                meshRelayService?.poolSharedSecret = SymmetricKey(data: keyData)
-            }
+            poolIntegritySecret = Self.configureRelay(meshRelayService, poolID: session.id, poolCode: session.poolCode)
         }
 
         // Start relay advertising for the host as well
@@ -1145,8 +1165,10 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         relayPeerConnectionTimes = [:]
         relayConnectedPeerIDs = []
 
-        // Clear mesh relay pool context
+        // Clear mesh relay pool context and end the envelope-signing session
         meshRelayService?.clearCurrentPool()
+        poolIntegritySecret = nil
+        envelopeSigningKeys.resetSession()
 
         poolState = .idle
         log("Disconnected from pool - all MC state cleaned up", category: .network)
@@ -1799,11 +1821,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
             log("[RELAY_SESSION] Created PoolSession for relay joiner: name=\(resolvedPoolName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
 
             // Wire mesh relay service with pool context for relay joiner
-            meshRelayService?.setCurrentPool(poolID)
-            if let code = joiningPoolCode {
-                let keyData = SHA256.hash(data: Data(code.utf8))
-                meshRelayService?.poolSharedSecret = SymmetricKey(data: keyData)
-            }
+            poolIntegritySecret = Self.configureRelay(meshRelayService, poolID: poolID, poolCode: joiningPoolCode)
 
             joiningPeer = nil
         }
@@ -1965,11 +1983,7 @@ extension ConnectionPoolManager: MCSessionDelegate {
                         log("Created PoolSession for non-host peer: name=\(resolvedPoolName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
 
                         // Wire mesh relay service with pool context for joiner
-                        self.meshRelayService?.setCurrentPool(poolID)
-                        if let code = self.joiningPoolCode {
-                            let keyData = SHA256.hash(data: Data(code.utf8))
-                            self.meshRelayService?.poolSharedSecret = SymmetricKey(data: keyData)
-                        }
+                        self.poolIntegritySecret = Self.configureRelay(self.meshRelayService, poolID: poolID, poolCode: self.joiningPoolCode)
 
                         // Clear the joining peer reference
                         joiningPeer = nil

@@ -8,6 +8,7 @@
 import Foundation
 import CryptoKit
 import Testing
+@testable import ConnectionPool
 
 struct GoldenVector: Sendable, CustomTestStringConvertible {
     let name: String
@@ -78,6 +79,7 @@ enum JSONValue: Sendable, Equatable {
     var bool: Bool? { if case .bool(let b) = self { return b }; return nil }
     var array: [JSONValue]? { if case .array(let a) = self { return a }; return nil }
     var isNull: Bool { self == .null }
+    var object: [String: JSONValue]? { if case .object(let o) = self { return o }; return nil }
 }
 
 enum Golden {
@@ -161,5 +163,39 @@ enum FuzzSeed {
     static func value(default fallback: UInt64) -> UInt64 {
         if let raw = ProcessInfo.processInfo.environment["WIRE_FUZZ_SEED"], let seed = UInt64(raw) { return seed }
         return fallback
+    }
+}
+
+// MARK: - Envelope signing helpers
+
+enum TestSigners {
+    /// A signer whose local key is the given Ed25519 seed.
+    static func signer(seed: Data) throws -> EnvelopeSigningKeys {
+        EnvelopeSigningKeys(localKey: try Curve25519.Signing.PrivateKey(rawRepresentation: seed))
+    }
+
+    /// A deterministic signer for `peerID` (same derivation as the Python generator).
+    static func signer(for peerID: String) -> EnvelopeSigningKeys {
+        let seed = Data(SHA256.hash(data: Data("golden-envelope-signing-seed:".utf8) + Data(peerID.utf8)))
+        return EnvelopeSigningKeys(localKey: try! Curve25519.Signing.PrivateKey(rawRepresentation: seed))
+    }
+
+    /// A receiver registry holding `known` peers' keys.
+    static func registry(knownPeers: [String]) -> EnvelopeSigningKeys {
+        let r = EnvelopeSigningKeys()
+        for peer in knownPeers {
+            r.install(peerID: peer, publicKey: try! Curve25519.Signing.PublicKey(rawRepresentation: signer(for: peer).localPublicKey))
+        }
+        return r
+    }
+
+    /// A receiver registry from a vector's `known_signers` map (peer ID -> public key hex).
+    static func registry(_ value: JSONValue?) throws -> EnvelopeSigningKeys {
+        let r = EnvelopeSigningKeys()
+        for (peer, hex) in value?.object ?? [:] {
+            let raw = try #require(hex.string.flatMap { Data(hex: $0) }, "known_signers[\(peer)]")
+            r.install(peerID: peer, publicKey: try Curve25519.Signing.PublicKey(rawRepresentation: raw))
+        }
+        return r
     }
 }
