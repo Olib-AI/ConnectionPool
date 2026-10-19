@@ -98,9 +98,40 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// PoolChat and games call `sendMessage()` which checks this first.
     public var remoteTransport: WebSocketTransport? {
         didSet {
-            if remoteTransport != nil {
+            if let remoteTransport {
                 log("Remote transport bridge activated", category: .network)
+                remoteTransport.onOuterLayerStatusChange = { [weak self] status in
+                    self?.applyOuterLayerStatus(status)
+                }
+                applyOuterLayerStatus(remoteTransport.outerLayerStatus)
+            } else {
+                applyOuterLayerStatus(.off)
             }
+        }
+    }
+
+    /// State of the remote pool's WebSocket outer encryption layer.
+    @Published public private(set) var remoteOuterLayerStatus: OuterLayerStatus = .off
+
+    /// Records the outer-layer state and flags 1.4.x peers in ``wireProtocolLedger``
+    /// (feature ``WireFeature/remoteTransport``) so the existing "older version" warning
+    /// covers them.
+    func applyOuterLayerStatus(_ status: OuterLayerStatus) {
+        remoteOuterLayerStatus = status
+        switch status {
+        case .unprotected(let legacyPeers, let legacyHost):
+            for peer in legacyPeers {
+                _ = wireProtocolLedger.admit(peerID: peer, feature: .remoteTransport, version: 1)
+            }
+            if legacyHost, let host = remoteTransport?.hostPeerID {
+                _ = wireProtocolLedger.admit(peerID: host, feature: .remoteTransport, version: 1)
+            }
+        case .protected:
+            for peer in wireProtocolLedger.legacyPeers(for: .remoteTransport) {
+                wireProtocolLedger.clearLegacyFlag(peerID: peer, feature: .remoteTransport)
+            }
+        default:
+            break
         }
     }
 

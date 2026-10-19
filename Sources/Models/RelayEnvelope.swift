@@ -102,6 +102,12 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
     /// (see ``EnvelopeSigningKeys``). Gives per-sender authenticity; `nil` on v1 envelopes.
     public var originSignature: Data?
 
+    /// Optional self-introduction by the origin (v2): its X25519 E2E key (32), its Ed25519
+    /// envelope-signing key (32) and their binding signature (64), 128 bytes in total.
+    /// Covered by the v2 MAC and the origin signature. Lets a peer that never had a direct
+    /// link to the origin learn its keys end to end (relayed key exchange).
+    public var originIntroduction: Data?
+
     // MARK: - Constants
 
     /// Maximum allowed TTL value.
@@ -145,7 +151,8 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
         envelopeVersion: Int? = nil,
         originTTL: Int? = nil,
         envelopeHMACV2: Data? = nil,
-        originSignature: Data? = nil
+        originSignature: Data? = nil,
+        originIntroduction: Data? = nil
     ) {
         self.messageID = messageID
         self.originPeerID = originPeerID
@@ -160,6 +167,7 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
         self.originTTL = originTTL
         self.envelopeHMACV2 = envelopeHMACV2
         self.originSignature = originSignature
+        self.originIntroduction = originIntroduction
     }
 
     // MARK: - Relay Operations
@@ -200,7 +208,8 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
             envelopeVersion: envelopeVersion,
             originTTL: originTTL,
             envelopeHMACV2: envelopeHMACV2,
-            originSignature: originSignature
+            originSignature: originSignature,
+            originIntroduction: originIntroduction
         )
     }
 

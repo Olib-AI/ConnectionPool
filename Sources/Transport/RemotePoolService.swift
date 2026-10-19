@@ -114,10 +114,16 @@ public struct ParsedInvitation: Sendable {
     /// When the invitation expires.
     public let expiresAt: Date
 
+    /// Host-added outer-layer bootstrap material from the URL fragment (StealthOS 1.5.0+
+    /// hosts). `nil` means the invitation came from a 1.4.x host.
+    public let transportSecret: TransportInviteSecret?
+
     public init(
         serverURL: URL, poolId: UUID, tokenId: Data,
-        tokenSecret: Data, hostFingerprint: Data, expiresAt: Date
+        tokenSecret: Data, hostFingerprint: Data, expiresAt: Date,
+        transportSecret: TransportInviteSecret? = nil
     ) {
+        self.transportSecret = transportSecret
         self.serverURL = serverURL
         self.poolId = poolId
         self.tokenId = tokenId
@@ -240,7 +246,14 @@ public final class RemotePoolService: ObservableObject {
             return nil
         }
 
-        guard let url = URL(string: created.url) else { return nil }
+        guard var url = URL(string: created.url) else { return nil }
+        let expiresAt = Date(timeIntervalSince1970: TimeInterval(created.expiresAt))
+
+        // Out-of-band outer-layer bootstrap: appended locally as a URL fragment, never sent
+        // to the relay. Joiners use it to fetch the pool transport secret from us.
+        if let secret = transport.makeInviteSecret(expiresAt: expiresAt), let withFragment = secret.appending(to: url) {
+            url = withFragment
+        }
 
         let invitation = RemoteInvitation(
             tokenId: created.tokenId,
@@ -345,13 +358,25 @@ public final class RemotePoolService: ObservableObject {
             serverURL = url
         }
 
+        // Host-added outer-layer material travels in the fragment, which the relay never
+        // sees. A fragment that is present but malformed is refused rather than ignored, so
+        // a tampered link cannot silently downgrade the pool to plaintext.
+        let transportSecret: TransportInviteSecret?
+        switch TransportInviteSecret.parse(fragment: url.fragment) {
+        case .success(let parsed): transportSecret = parsed
+        case .failure: return nil
+        }
+        // (`fp` in the token is the relay server's fingerprint, not the pool host's, so the
+        // host key is checked against the server's host_peer_id after joining instead.)
+
         return ParsedInvitation(
             serverURL: serverURL,
             poolId: poolUUID,
             tokenId: Data(wire.id),
             tokenSecret: Data(wire.secret),
             hostFingerprint: Data(wire.fp),
-            expiresAt: Date(timeIntervalSince1970: TimeInterval(wire.exp))
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(wire.exp)),
+            transportSecret: transportSecret
         )
     }
 

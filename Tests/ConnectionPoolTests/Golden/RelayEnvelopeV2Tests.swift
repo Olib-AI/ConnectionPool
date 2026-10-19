@@ -42,8 +42,8 @@ struct RelayEnvelopeV2VectorTests {
     @Test("v2 vector file inventory")
     func inventory() {
         #expect(Golden.vectors(v2File, kind: "hmac_key_v2").count == 1)
-        #expect(Golden.vectors(v2File, kind: "envelope_v2").count == 10)
-        #expect(Golden.vectors(v2File, kind: "envelope_v2_tamper").count == 30)
+        #expect(Golden.vectors(v2File, kind: "envelope_v2").count == 11)
+        #expect(Golden.vectors(v2File, kind: "envelope_v2_tamper").count == 35)
         #expect(Golden.vectors(v2File, kind: "signing_key_binding").count == 8)
     }
 
@@ -120,13 +120,21 @@ struct RelayEnvelopeV2VectorTests {
         #expect(e.verify(sharedSecret: secret, receiverPoolID: pool, ledger: ledger, signers: signers, now: e.timestamp) == .acceptedV2)
         #expect(ledger.isPinnedToV2(e.originPeerID, feature: .relayEnvelope))
 
+        if let introHex = v.outputs["origin_introduction_hex"]?.string {
+            #expect(e.originIntroduction == Data(hex: introHex))
+            #expect(e.introduction?.keyAgreementKey == (try v.outputHex("introduced_key_agreement_hex")))
+            #expect(signers.signingKey(for: e.originPeerID) == nil, "first contact: the receiver had no key")
+        }
+
         // Production re-encoding keeps every v2 field.
         let round = try #require(e.encode().flatMap(RelayEnvelope.decode(from:)))
         #expect(round.verify(sharedSecret: secret, receiverPoolID: pool, ledger: PeerProtocolLedger(), signers: signers, now: e.timestamp) == .acceptedV2)
     }
 
     @Test("Origin-side signing reproduces the reference MACs and a verifiable signature",
-          arguments: Golden.vectors(v2File, kind: "envelope_v2").filter { $0.inputs["ttl"]?.int == $0.inputs["origin_ttl"]?.int })
+          arguments: Golden.vectors(v2File, kind: "envelope_v2").filter {
+              $0.inputs["ttl"]?.int == $0.inputs["origin_ttl"]?.int && $0.outputs["origin_introduction_hex"] == nil
+          })
     func originSigning(_ v: GoldenVector) throws {
         let secret = SymmetricKey(data: try v.inputHex("shared_secret_hex"))
         let pool = try v.inputUUID("pool_id")
@@ -173,6 +181,8 @@ struct RelayEnvelopeV2VectorTests {
         switch try v.outputString("verdict") {
         case "relay_only":
             #expect(verdict == .relayOnlyUnknownSigner, "\(v.name): \(verdict)")
+        case "key_change":
+            #expect(verdict == .rejectedKeyChange, "\(v.name): \(verdict)")
         default:
             if case .rejectedInvalid = verdict {} else { Issue.record("\(v.name) must be rejected, got \(verdict)") }
             #expect(!verdict.mayForward)
@@ -378,6 +388,7 @@ struct RelayEnvelopeV2TamperTests {
         expected += Data([0, 0, 0, 5])
         expected += withUnsafeBytes(of: now.timeIntervalSinceReferenceDate.bitPattern.bigEndian) { Data($0) }
         expected += Data([0, 0, 0, 0, 0, 0, 0, 1, 0xAA])
+        expected += Data([0x00]) // no introduction
         #expect(input == expected)
     }
 }

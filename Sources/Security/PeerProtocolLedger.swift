@@ -18,6 +18,8 @@ public enum WireFeature: String, Sendable, Hashable, CaseIterable, Codable {
     case relayEnvelope = "relay_envelope"
     /// Encrypted call media frames.
     case callMedia = "call_media"
+    /// The remote pool's WebSocket outer layer (pool transport secret).
+    case remoteTransport = "remote_transport"
 
     /// Highest version this build speaks.
     public var currentVersion: Int { 2 }
@@ -156,6 +158,16 @@ public final class PeerProtocolLedger: @unchecked Sendable {
     /// Peers currently flagged as running an older, less secure version of `feature`.
     public func legacyPeers(for feature: WireFeature) -> Set<String> {
         lock.withLock { _legacyPeers[feature] ?? [] }
+    }
+
+    /// Clears the "legacy" UI flag for one feature (for example once that feature is
+    /// protected pool-wide and legacy peers are excluded instead). Pins are kept.
+    public func clearLegacyFlag(peerID: String, feature: WireFeature) {
+        var changed: Set<String>?
+        lock.withLock {
+            if _legacyPeers[feature]?.remove(peerID) != nil { changed = _legacyPeers[feature] ?? [] }
+        }
+        if let changed { legacyPeersSubject.send((feature, changed)) }
     }
 
     /// Clears the "legacy" UI flag for a peer that left. The downgrade pin is kept.

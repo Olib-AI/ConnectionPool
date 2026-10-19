@@ -56,6 +56,8 @@ public final class EnvelopeSigningKeys: @unchecked Sendable {
     private let lock = NSLock()
     private var _local: Curve25519.Signing.PrivateKey
     private var _peers: [String: Curve25519.Signing.PublicKey] = [:]
+    /// Refused replacement keys, kept so the user can deliberately trust them.
+    private var _pendingChanges: [String: Curve25519.Signing.PublicKey] = [:]
     private let eventSubject = PassthroughSubject<Event, Never>()
 
     public var events: AnyPublisher<Event, Never> { eventSubject.eraseToAnyPublisher() }
@@ -125,9 +127,12 @@ public final class EnvelopeSigningKeys: @unchecked Sendable {
         let result: Registration = lock.withLock {
             if let existing = _peers[peerID] {
                 if existing.rawRepresentation == signingPublicKey { return .unchanged }
-                event = .keyChangeRefused(peerID: peerID,
-                                          oldFingerprint: Self.fingerprint(existing.rawRepresentation),
-                                          newFingerprint: Self.fingerprint(signingPublicKey))
+                if _pendingChanges[peerID]?.rawRepresentation != signingPublicKey {
+                    event = .keyChangeRefused(peerID: peerID,
+                                              oldFingerprint: Self.fingerprint(existing.rawRepresentation),
+                                              newFingerprint: Self.fingerprint(signingPublicKey))
+                }
+                _pendingChanges[peerID] = key
                 return .refusedKeyChange
             }
             _peers[peerID] = key
@@ -149,7 +154,25 @@ public final class EnvelopeSigningKeys: @unchecked Sendable {
 
     /// Drops a peer's key after its direct, transport-authenticated connection ended.
     public func forget(peerID: String) {
-        _ = lock.withLock { _peers.removeValue(forKey: peerID) }
+        lock.withLock {
+            _peers.removeValue(forKey: peerID)
+            _pendingChanges.removeValue(forKey: peerID)
+        }
+    }
+
+    /// Fingerprint of a refused replacement key awaiting the user's decision, if any.
+    public func pendingKeyChangeFingerprint(for peerID: String) -> String? {
+        lock.withLock { _pendingChanges[peerID].map { Self.fingerprint($0.rawRepresentation) } }
+    }
+
+    /// The user verified the new key out of band: replace the old one.
+    @discardableResult
+    public func acceptPendingKeyChange(for peerID: String) -> Bool {
+        lock.withLock {
+            guard let key = _pendingChanges.removeValue(forKey: peerID) else { return false }
+            _peers[peerID] = key
+            return true
+        }
     }
 
     /// New local key and no peer keys: call when the pool session ends.
@@ -157,6 +180,7 @@ public final class EnvelopeSigningKeys: @unchecked Sendable {
         lock.withLock {
             _local = Curve25519.Signing.PrivateKey()
             _peers.removeAll()
+            _pendingChanges.removeAll()
         }
     }
 

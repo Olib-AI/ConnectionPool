@@ -264,14 +264,15 @@ public final class MeshRelayService: ObservableObject {
     ///   - payload: The encrypted payload data to send.
     ///   - poolID: The pool ID for the message.
     /// - Returns: `true` if the message was sent (not necessarily delivered), `false` if no path found.
-    public func sendToPeer(_ peerID: String, payload: Data, poolID: UUID) async -> Bool {
-        guard let poolManager = poolManager else {
+    public func sendToPeer(_ peerID: String, payload: Data, poolID: UUID,
+                           introducingKeyAgreementKey: Data? = nil) async -> Bool {
+        guard poolManager != nil || neighborSender != nil else {
             log("Cannot send: pool manager not set", level: .warning, category: .network)
             return false
         }
-        
-        // Check if peer is directly reachable
-        if topology.canReachDirectly(peerID) {
+
+        // Check if peer is directly reachable (introductions always travel in an envelope)
+        if introducingKeyAgreementKey == nil, let poolManager, topology.canReachDirectly(peerID) {
             // Direct send - no envelope needed, just send the payload
             log("Sending direct message to peer: \(peerID.prefix(8))...", category: .network)
             
@@ -303,10 +304,19 @@ public final class MeshRelayService: ObservableObject {
             return false
         }
 
+        // Optional self-introduction for a peer we have never exchanged keys with.
+        var introduction: RelayEnvelope.Introduction?
+        if let keyAgreementKey = introducingKeyAgreementKey {
+            guard let binding = signingKeys.makeBinding(localPeerID: localPeerID, poolID: poolID, keyAgreementPublicKey: keyAgreementKey) else {
+                return false
+            }
+            introduction = RelayEnvelope.Introduction(keyAgreementKey: keyAgreementKey, signingKey: signingKeys.localPublicKey, binding: binding)
+        }
+
         // Create relay envelope signed for both v1 (1.4.x) and v2 (1.5.0+) receivers.
         let envelope = Self.makeSignedEnvelope(
             origin: localPeerID, destination: peerID, payload: payload,
-            poolID: poolID, sharedSecret: sharedSecret, signer: signingKeys
+            poolID: poolID, sharedSecret: sharedSecret, signer: signingKeys, introduction: introduction
         )
 
         // Mark as processed to prevent echo
@@ -402,10 +412,21 @@ public final class MeshRelayService: ObservableObject {
             return
         }
 
-        let verdict = envelope.verify(sharedSecret: sharedSecret, receiverPoolID: currentPoolID,
+        var verdict = envelope.verify(sharedSecret: sharedSecret, receiverPoolID: currentPoolID,
                                       ledger: protocolLedger, signers: signingKeys)
+        let addressedToUs = envelope.isIntendedFor(localPeerID)
+        // Key introductions and key changes are the destination's decision. A pure relay
+        // neither learns an origin's key from envelopes meant for others nor blocks them.
+        if !addressedToUs, envelope.originIntroduction != nil, verdict == .acceptedV2 || verdict == .rejectedKeyChange {
+            verdict = .relayOnlyUnknownSigner
+        }
         switch verdict {
         case .acceptedV2:
+            if let intro = envelope.introduction {
+                // First contact through relays (TOFU, verified end to end above).
+                signingKeys.register(peerID: envelope.originPeerID, signingPublicKey: intro.signingKey, binding: intro.binding,
+                                     keyAgreementPublicKey: intro.keyAgreementKey, poolID: currentPoolID)
+            }
             if legacyEnvelopeOrigins.contains(envelope.originPeerID) {
                 legacyEnvelopeOrigins.remove(envelope.originPeerID)
             }
@@ -428,6 +449,16 @@ public final class MeshRelayService: ObservableObject {
         case .rejectedLegacy:
             log("[SECURITY] Dropping v1 envelope (legacy peers refused by policy). messageID: \(envelope.messageID)",
                 level: .warning, category: .network)
+            droppedMessageCount += 1
+            return
+        case .rejectedKeyChange:
+            log("[SECURITY] Dropping envelope: \(envelope.originPeerID.prefix(8))... introduced a different signing key mid-session. messageID: \(envelope.messageID)",
+                level: .warning, category: .network)
+            if let intro = envelope.introduction {
+                // Records the refused key for the user and emits the key-change event.
+                signingKeys.register(peerID: envelope.originPeerID, signingPublicKey: intro.signingKey, binding: intro.binding,
+                                     keyAgreementPublicKey: intro.keyAgreementKey, poolID: currentPoolID)
+            }
             droppedMessageCount += 1
             return
         case .rejectedInvalid(let reason):
@@ -505,7 +536,8 @@ public final class MeshRelayService: ObservableObject {
         sharedSecret: SymmetricKey,
         signer: EnvelopeSigningKeys,
         messageID: UUID = UUID(),
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        introduction: RelayEnvelope.Introduction? = nil
     ) -> RelayEnvelope {
         RelayEnvelope(
             messageID: messageID,
@@ -518,7 +550,8 @@ public final class MeshRelayService: ObservableObject {
         ).signedForV2(
             v1Key: RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID),
             v2Key: RelayEnvelope.deriveHMACKeyV2(from: sharedSecret, poolID: poolID),
-            signer: signer
+            signer: signer,
+            introduction: introduction
         )
     }
 
@@ -841,12 +874,19 @@ public final class MeshRelayService: ObservableObject {
     }
     
     /// Send an envelope to a specific neighbor.
+    /// Test seam (internal): delivers neighbour messages without a ConnectionPoolManager.
+    var neighborSender: (@MainActor (PoolMessage, String) -> Void)?
+
     private func sendEnvelopeToNeighbor(_ envelope: RelayEnvelope, neighborID: String) {
-        guard let poolManager = poolManager else { return }
         guard let data = envelope.encode() else {
             log("Failed to encode relay envelope", level: .error, category: .network)
             return
         }
+        if let neighborSender {
+            neighborSender(PoolMessage.relayEnvelope(from: localPeerID, senderName: localPeerID, envelopeData: data), neighborID)
+            return
+        }
+        guard let poolManager = poolManager else { return }
 
         let message = PoolMessage.relayEnvelope(
             from: localPeerID,

@@ -33,6 +33,8 @@ import CryptoKit
 //                                                      IEEE-754 binary64, exactly the JSON
 //                                                      "timestamp" number (seconds since 2001)
 //   u64 len || encryptedPayload
+//   u8 0x00                                            no introduction
+//   | u8 0x01 || X25519(32) || Ed25519(32) || binding(64)  originIntroduction
 //
 // originSignature = Ed25519 by the origin's per-session signing key (EnvelopeSigningKeys)
 // over exactly the bytes above. The pool MAC filters non-members cheaply; the signature
@@ -90,6 +92,13 @@ extension RelayEnvelope {
         Self.appendBE(timestamp.timeIntervalSinceReferenceDate.bitPattern, to: &out)
         Self.appendBE(UInt64(encryptedPayload.count), to: &out)
         out.append(encryptedPayload)
+        if let originIntroduction {
+            guard originIntroduction.count == Self.introductionLength else { return nil }
+            out.append(0x01)
+            out.append(originIntroduction)
+        } else {
+            out.append(0x00)
+        }
         return out
     }
 
@@ -109,15 +118,43 @@ extension RelayEnvelope {
 
     /// Whether this envelope claims to be v2 (carries any v2 field).
     public var claimsV2: Bool {
-        envelopeVersion != nil || envelopeHMACV2 != nil || originTTL != nil || originSignature != nil
+        envelopeVersion != nil || envelopeHMACV2 != nil || originTTL != nil || originSignature != nil || originIntroduction != nil
     }
+
+    /// Length of ``originIntroduction``.
+    public static let introductionLength = 128
+
+    /// The parts of ``originIntroduction``.
+    public struct Introduction: Sendable, Equatable {
+        public let keyAgreementKey: Data
+        public let signingKey: Data
+        public let binding: Data
+
+        public init(keyAgreementKey: Data, signingKey: Data, binding: Data) {
+            self.keyAgreementKey = keyAgreementKey
+            self.signingKey = signingKey
+            self.binding = binding
+        }
+
+        public var encoded: Data { keyAgreementKey + signingKey + binding }
+
+        public init?(_ data: Data?) {
+            guard let data, data.count == RelayEnvelope.introductionLength else { return nil }
+            let b = [UInt8](data)
+            keyAgreementKey = Data(b[0..<32]); signingKey = Data(b[32..<64]); binding = Data(b[64..<128])
+        }
+    }
+
+    public var introduction: Introduction? { Introduction(originIntroduction) }
 
     /// Returns a copy carrying the v1 MAC (for 1.4.x peers), the v2 pool MAC and the
     /// origin's Ed25519 signature over the v2 input.
     ///
     /// `originTTL` is set to the envelope's current `ttl`; call this on the origin only.
-    public func signedForV2(v1Key: SymmetricKey, v2Key: SymmetricKey, signer: EnvelopeSigningKeys) -> RelayEnvelope {
+    public func signedForV2(v1Key: SymmetricKey, v2Key: SymmetricKey, signer: EnvelopeSigningKeys,
+                            introduction: Introduction? = nil) -> RelayEnvelope {
         var copy = self
+        copy.originIntroduction = introduction?.encoded
         copy.envelopeHMAC = computeHMAC(using: v1Key)
         copy.envelopeVersion = Self.currentEnvelopeVersion
         copy.originTTL = ttl
@@ -178,6 +215,9 @@ public enum RelayEnvelopeVerdict: Sendable, Equatable {
     case rejectedDowngrade
     /// v1-only envelope and the legacy policy is ``LegacyPeerPolicy/refuse``.
     case rejectedLegacy
+    /// The envelope introduces a different signing key for an origin whose key we already
+    /// hold this session (possible impersonation). Refused and reported.
+    case rejectedKeyChange
 
     /// Whether the payload may be delivered to the local user.
     public var isAccepted: Bool {
@@ -221,8 +261,29 @@ extension RelayEnvelope {
             guard let signature = originSignature, signature.count == 64 else {
                 return .rejectedInvalid(reason: "v2 origin signature missing")
             }
-            guard let signingKey = signers.signingKey(for: originPeerID) else {
-                return .relayOnlyUnknownSigner
+            let known = signers.signingKey(for: originPeerID)
+            let signingKey: Curve25519.Signing.PublicKey
+            if originIntroduction != nil {
+                // End-to-end verifiable introduction: the binding ties the signing key to
+                // this origin ID, this pool and the introduced E2E key, and the envelope
+                // signature below proves the origin holds that signing key.
+                guard let intro = introduction,
+                      let introKey = try? Curve25519.Signing.PublicKey(rawRepresentation: intro.signingKey),
+                      introKey.isValidSignature(intro.binding, for: EnvelopeSigningKeys.bindingStatement(
+                        peerID: originPeerID, poolID: receiverPoolID,
+                        keyAgreementPublicKey: intro.keyAgreementKey, signingPublicKey: intro.signingKey)) else {
+                    return .rejectedInvalid(reason: "v2 introduction binding invalid")
+                }
+                guard verifyOriginSignature(using: introKey) else {
+                    return .rejectedInvalid(reason: "v2 origin signature invalid")
+                }
+                if let known, known.rawRepresentation != intro.signingKey {
+                    return .rejectedKeyChange
+                }
+                signingKey = introKey
+            } else {
+                guard let known else { return .relayOnlyUnknownSigner }
+                signingKey = known
             }
             guard verifyOriginSignature(using: signingKey) else {
                 return .rejectedInvalid(reason: "v2 origin signature invalid")

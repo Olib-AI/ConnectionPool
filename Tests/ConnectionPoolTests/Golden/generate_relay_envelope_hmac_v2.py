@@ -34,13 +34,14 @@ K1, K2 = keys(SECRET, POOL)
 def v1_input(o, d, pool, mid, ts):
     return lp(o.encode()) + lp((d or "").encode()) + ub(pool) + ub(mid) + struct.pack("<q", 5) + struct.pack("<d", ts + 978307200.0)
 
-def v2_input(o, d, pool, mid, otl, ts, payload):
+def v2_input(o, d, pool, mid, otl, ts, payload, intro=None):
     b = lp(b"STEALTH_RELAY_ENVELOPE_V2") + lp(o.encode())
     b += b"\x00" if d is None else b"\x01" + lp(d.encode())
     b += ub(pool) + ub(mid) + struct.pack(">I", otl) + struct.pack(">d", ts) + struct.pack(">Q", len(payload)) + payload
+    b += b"\x00" if intro is None else b"\x01" + intro
     return b
 
-def env_json(o, d, ttl, hops, payload, pool, mid, ts, h1, v, otl, h2, sig):
+def env_json(o, d, ttl, hops, payload, pool, mid, ts, h1, v, otl, h2, sig, intro=None):
     j = {"messageID": mid.upper(), "originPeerID": o, "ttl": ttl, "hopPath": hops,
          "encryptedPayload": base64.b64encode(payload).decode(), "poolID": pool.upper(), "timestamp": ts}
     if d is not None: j["destinationPeerID"] = d
@@ -49,12 +50,13 @@ def env_json(o, d, ttl, hops, payload, pool, mid, ts, h1, v, otl, h2, sig):
     if otl is not None: j["originTTL"] = otl
     if h2 is not None: j["envelopeHMACV2"] = base64.b64encode(h2).decode()
     if sig is not None: j["originSignature"] = base64.b64encode(sig).decode()
+    if intro is not None: j["originIntroduction"] = base64.b64encode(intro).decode()
     return json.dumps(j, ensure_ascii=False, sort_keys=True)
 
-def signed(o, d, payload, ts, otl=5, mid=MSG, pool=POOL, secret=SECRET, signer=None):
+def signed(o, d, payload, ts, otl=5, mid=MSG, pool=POOL, secret=SECRET, signer=None, intro=None):
     k1, k2 = keys(secret, pool)
     h1 = hmac.new(k1, v1_input(o, d, pool, mid, ts), hashlib.sha256).digest()
-    i2 = v2_input(o, d, pool, mid, otl, ts, payload)
+    i2 = v2_input(o, d, pool, mid, otl, ts, payload, intro)
     h2 = hmac.new(k2, i2, hashlib.sha256).digest()
     s = sk(signer or o).sign(i2)
     return h1, h2, s, i2
@@ -167,6 +169,54 @@ for name, desc, j, recv, verdict in tampers:
                     "inputs": {"envelope_json": j, "receiver_pool_id": recv, "shared_secret_hex": SECRET.hex(), "known_signers": known_signers()},
                     "outputs": {"verdict": verdict}})
 
+# Introductions (relayed key exchange, first contact through relays).
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+def x25519_pub(peer):
+    k = X25519PrivateKey.from_private_bytes(hashlib.sha256(b"golden-x25519-seed:" + peer.encode()).digest())
+    return k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+def intro_for(peer, pool=POOL, as_peer=None, signer=None):
+    x = x25519_pub(peer)
+    spub = pub(signer or peer)
+    binding = sk(signer or peer).sign(statement(as_peer or peer, pool, x, spub))
+    return x + spub + binding
+NEW = "peer-newcomer"
+it = intro_for(NEW)
+ih1, ih2, isig, ii2 = signed(NEW, "peer-dest", b"relayed-key-exchange", TS, intro=it)
+vectors.append({"name": "introduction_first_contact", "kind": "envelope_v2", "expect": "ok",
+    "description": "First contact through relays: the envelope introduces the origin's X25519 and Ed25519 keys with their binding; the receiver has no key for the origin yet and verifies everything end to end.",
+    "inputs": {"origin_peer_id": NEW, "destination_peer_id": "peer-dest", "ttl": 5, "origin_ttl": 5, "hop_path": [NEW],
+               "payload_hex": b"relayed-key-exchange".hex(), "pool_id": POOL, "receiver_pool_id": POOL, "message_id": MSG,
+               "shared_secret_hex": SECRET.hex(), "timestamp_since_2001": TS,
+               "origin_signing_seed_hex": seed_for(NEW).hex(), "known_signers": known_signers()},
+    "outputs": {"envelope_json": env_json(NEW, "peer-dest", 5, [NEW], b"relayed-key-exchange", POOL, MSG, TS, ih1, 2, 5, ih2, isig, it),
+                "hmac_v2_input_hex": ii2.hex(), "hmac_v2_hex": ih2.hex(), "hmac_v1_hex": ih1.hex(),
+                "origin_signing_public_hex": pub(NEW).hex(), "origin_signature_hex": isig.hex(),
+                "origin_introduction_hex": it.hex(), "introduced_key_agreement_hex": x25519_pub(NEW).hex(),
+                "timestamp_f64_be_hex": struct.pack(">d", TS).hex()}})
+# Insider impersonation at a receiver that already knows the newcomer's real key.
+fake = intro_for(NEW, signer="peer-mallory")
+fh1b, fh2b, fsigb, _ = signed(NEW, "peer-dest", b"relayed-key-exchange", TS, intro=fake, signer="peer-mallory")
+known_with_new = known_signers(KNOWN + [NEW])
+bad_binding = intro_for(NEW, pool=POOL2)
+bh1, bh2, bsig, _ = signed(NEW, "peer-dest", b"relayed-key-exchange", TS, intro=bad_binding)
+wrong_peer = intro_for(NEW, as_peer="peer-other")
+wh1, wh2, wsig, _ = signed(NEW, "peer-dest", b"relayed-key-exchange", TS, intro=wrong_peer)
+for name, desc, j, known, verdict in [
+    ("introduction_conflicting_key", "A member introduces its own key for peer-newcomer to a receiver that already holds the newcomer's real key: refused as a key change.",
+     env_json(NEW, "peer-dest", 5, [NEW], b"relayed-key-exchange", POOL, MSG, TS, fh1b, 2, 5, fh2b, fsigb, fake), known_with_new, "key_change"),
+    ("introduction_binding_other_pool", "Introduction binding made for another pool.",
+     env_json(NEW, "peer-dest", 5, [NEW], b"relayed-key-exchange", POOL, MSG, TS, bh1, 2, 5, bh2, bsig, bad_binding), known_signers(), "rejected_invalid"),
+    ("introduction_binding_other_peer", "Introduction binding made for another peer ID.",
+     env_json(NEW, "peer-dest", 5, [NEW], b"relayed-key-exchange", POOL, MSG, TS, wh1, 2, 5, wh2, wsig, wrong_peer), known_signers(), "rejected_invalid"),
+    ("introduction_stripped", "A relay removes the introduction: the MAC and signature cover it, so the envelope fails.",
+     env_json(NEW, "peer-dest", 5, [NEW], b"relayed-key-exchange", POOL, MSG, TS, ih1, 2, 5, ih2, isig, None), known_signers(), "rejected_invalid"),
+    ("introduction_key_agreement_swapped", "A relay swaps the introduced X25519 key for its own.",
+     env_json(NEW, "peer-dest", 5, [NEW], b"relayed-key-exchange", POOL, MSG, TS, ih1, 2, 5, ih2, isig, x25519_pub("peer-mallory") + it[32:]), known_signers(), "rejected_invalid"),
+]:
+    vectors.append({"name": name, "kind": "envelope_v2_tamper", "expect": "error", "description": desc,
+                    "inputs": {"envelope_json": j, "receiver_pool_id": POOL, "shared_secret_hex": SECRET.hex(), "known_signers": known},
+                    "outputs": {"verdict": verdict}})
+
 doc = {
  "format": "relay-envelope-hmac-v2", "schema_version": 1,
  "description": "RelayEnvelope integrity v2 (StealthOS 1.5.0+). The v1 envelopeHMAC is still attached for 1.4.x peers; v2 receivers check the v2 pool MAC (cheap filter), the routing invariants, and the origin's Ed25519 signature. MAC/signature input (big-endian): lp32('STEALTH_RELAY_ENVELOPE_V2') || lp32(origin UTF-8) || (0x00 | 0x01 || lp32(destination UTF-8)) || pool_id(16) || message_id(16) || u32 originTTL || u64 bits(timestamp seconds since 2001 as f64) || u64 len || payload.",
@@ -182,6 +232,8 @@ doc = {
   "Routing invariants enforced after the MAC: 1 <= ttl <= originTTL <= 5, hopPath[0] == originPeerID, len(hopPath) + ttl == originTTL + 1.",
   "Any v2 field present means the envelope is verified as v2 only; there is no fallback to the v1 MAC.",
   "Signing seeds are SHA-256('golden-envelope-signing-seed:' || peerID UTF-8); known_signers maps peer IDs to the receiver's registered public keys.",
+  "The MAC/signature input ends with u8 0x00, or u8 0x01 || originIntroduction (X25519(32) || Ed25519(32) || binding(64)). An introduction lets a receiver with no key for the origin verify it end to end (binding for origin ID, pool and E2E key, plus the signature); a different key for an origin already known is refused (key_change).",
+  "X25519 seeds for introductions are SHA-256('golden-x25519-seed:' || peerID UTF-8).",
   "envelope_json is serialised with sorted keys by this generator; Swift's JSONEncoder key order differs. Compare decoded values, not bytes.",
   "Generated by an independent Python reference (hmac/hashlib + cryptography Ed25519), not by the Swift code under test."
  ],

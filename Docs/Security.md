@@ -10,7 +10,9 @@ Security is not bolted on. It is structural, and every layer enforces its own gu
 - [Pool Code Authentication](#pool-code-authentication)
 - [Brute-Force Protection](#brute-force-protection)
 - [Remote Relay Security](#remote-relay-security)
+- [Remote Transport Outer Layer](#remote-transport-outer-layer)
 - [Relay Envelope Integrity (HMAC-SHA256)](#relay-envelope-integrity-hmac-sha256)
+- [Relayed Key Exchange](#relayed-key-exchange)
 - [Loop and Amplification Prevention](#loop-and-amplification-prevention)
 - [Inbound Size Limits](#inbound-size-limits)
 - [Separate Relay Service Type](#separate-relay-service-type)
@@ -36,7 +38,7 @@ Provided by [StealthRelay](https://github.com/Olib-AI/StealthRelay).
 | Layer | Mechanism |
 |-------|-----------|
 | **Host Authentication** | Ed25519 signature over `pool_id \|\| timestamp \|\| nonce` where nonce is a server-issued per-connection challenge; timestamp window tightened to 30 seconds |
-| **E2E Relay Encryption** | AES-GCM encryption with a key derived from the pool shared secret via HKDF-SHA256 (`stealth-ws-encrypt` info); the relay server sees only opaque ciphertext |
+| **Outer encryption layer** | Every frame between members is AES-256-GCM encrypted with a host-generated pool transport secret the relay never sees (StealthOS 1.5.0+; see [Remote Transport Outer Layer](#remote-transport-outer-layer)). Pools with a StealthOS 1.4.x member or host run without it (the inner Pool Chat E2E layer still applies) and the app says so |
 | **Session Tokens** | 32-byte server-issued token required for all privileged operations from both host and guest peers; included in Forward frames for all roles (constant-time comparison) |
 | **Invitation Tokens** | Ed25519-signed URLs with HMAC proof-of-possession, configurable expiry and max uses, `server_address` bound in signature |
 | **Proof-of-Work** | SHA-256 hashcash (18-bit difficulty) required before join requests are forwarded to the host. The client refuses challenges that are not 32 bytes or ask for more than 26 bits (the relay's top tier), solves under a 90 s budget, cancels on disconnect, and fails the connection with a clear error otherwise |
@@ -44,6 +46,25 @@ Provided by [StealthRelay](https://github.com/Olib-AI/StealthRelay).
 | **Server Claiming** | One-time claim code binds a server to a host identity; the code is destroyed after use |
 | **Display Name Sanitization** | All display names are stripped of control characters and newlines, then truncated to 64 characters before logging or storage |
 | **Per-Pool Isolation** | Pending joins, session tokens, and server URLs are all scoped per-pool, so there is no cross-pool state leakage |
+
+## Remote Transport Outer Layer
+
+Remote pools talk through StealthRelay. Pool Chat content is already end-to-end encrypted per peer pair, but the relay operator would otherwise see every frame's metadata (message types, sender names, key exchanges, timing per peer). The outer layer encrypts every member-to-member frame with a **pool transport secret** that only the host and approved members hold. Before 1.5.0 this layer existed in code but was never switched on, because no secret was ever distributed.
+
+**Distribution (decision).** The relay builds invitations and knows the token secret in them, so neither the invitation's server-built part nor anything sent through the relay in the clear can carry the secret. Design:
+
+1. The host generates a random 256-bit transport secret (epoch 1) when the pool starts, stored in the Keychain.
+2. For each invitation the host also generates a random 256-bit *invite key* and appends `#v2.<base64url(0x02 || inviteKey || hostIdentityKey)>` to the invitation URL **locally**. URL fragments are never sent to a server, and the invitation travels out of band (QR, AirDrop, message), so the relay never learns the invite key. StealthOS 1.4.x ignores the fragment. A present but malformed fragment rejects the invitation, so it cannot be silently stripped to "no fragment".
+3. After joining, the member checks that the relay's `host_peer_id` is the host key from the fragment (the relay names hosts and members by their Ed25519 identity keys), then sends a key request: an ephemeral X25519 key and a nonce, signed with its member identity key and MAC'd with the invite key.
+4. The host verifies the signature, the invite MAC (first join) or the enrolment (later reconnects, rotations), the nonce and the timestamp. It then seals the secret under `HKDF(X25519(hostEphemeral, memberEphemeral), salt: SHA-256(request), info: "STEALTH_WS_TRANSPORT_KEY_V2" || epoch || inviteKey)` and signs the grant with the host identity key.
+
+The relay forwards these control messages (`"SWK2" || JSON`) but never sees the secret. It cannot impersonate a joiner without the invite key, cannot impersonate the host without the host identity key, and cannot learn the secret from the sealed grant. Embedding the secret directly in the invitation was rejected: anyone who saw the link, approved or not, could read the pool's outer layer forever, and the secret could never be rotated.
+
+**Frames.** `"SWO2" || epoch u32 || sender session u64 || counter u64 || timestamp ms i64 || nonce(12) || AES-256-GCM(frame) || tag`, key `HKDF(secret, salt: poolID, info: "STEALTH_WS_OUTER_V2" || epoch)`, AAD = header || poolID || sender peer ID. Receivers reject frames older than 5 minutes or more than 60 s in the future, and keep a replay window per sender session. Once a pool is protected, plaintext frames are refused (fail closed). A member that is still securing holds its outgoing frames rather than send them in the clear.
+
+**Versions and legacy peers.** The host turns protection on when every member present has enrolled. A pool that has a 1.4.x member at that point stays unprotected, and everyone is told (`OuterLayerStatus.unprotected(legacyPeers:)`, fed into the "older version" warning). Once a pool has been protected it is never turned off. A 1.4.x member who joins later is excluded rather than causing a downgrade, and the UI says so. Members persist "this pool is protected" and refuse a later "protection off" announcement (`downgradeRefused`). Invitations without a fragment come from a 1.4.x host: such sessions run unprotected and are flagged.
+
+**Rotation.** When the host removes or kicks a member, its enrolment is deleted and a new secret (epoch + 1) is generated. Remaining members fetch it with a signed request, and the host switches after they have, or after 10 s. Frames under the previous epoch are accepted for 30 s, never from the removed member. A removed member cannot obtain the new secret.
 
 ## Relay Envelope Integrity (HMAC-SHA256)
 
@@ -78,9 +99,20 @@ The per-hop `ttl` and `hopPath` cannot be MAC'd by the origin. v2 binds `originT
 
 The pool MAC key comes from `PoolIntegritySecret`: `SHA-256(pool code)`, the one secret every member of a local pool shares (the host generates the code, joiners type it). This is the derivation 1.4.x already used. Pools without a code, and remote pools, have no pool-wide secret, so mesh relaying is disabled for them rather than run on a made-up key. Feature packages must use `ConnectionPoolManager.meshRelay` instead of creating their own `MeshRelayService`.
 
+**Introductions.** A v2 envelope may carry `originIntroduction`: the origin's X25519 E2E key, Ed25519 signing key and their binding (128 bytes, covered by the MAC and the signature). A destination with no key for the origin verifies the binding (origin ID, pool, both keys) and the signature end to end, then registers the key (TOFU). A different key for an origin it already knows is refused (`rejectedKeyChange`) and offered to the user (`pendingKeyChangeFingerprint` / `acceptPendingKeyChange`). Relays forward introductions addressed to others without learning or judging them.
+
 **Stripped by a 1.4.x relay.** A 1.4.x relay drops the v2 fields when it re-encodes an envelope. If the origin has already proven v2, the stripped copy is refused (fail closed). When it was addressed to us, `MeshRelayService.unverifiableRelayedMessage` reports it (at most once a minute per origin) so the app can tell the user a message from that peer could not be verified. The content is never delivered.
 
 Golden vectors: `Tests/ConnectionPoolTests/Golden/relay_envelope_hmac_v2.json` (generated independently by `generate_relay_envelope_hmac_v2.py`).
+
+## Relayed Key Exchange
+
+Peers connected only through other peers exchange E2E keys over signed v2 envelopes with introductions (Pool Chat's `RelayedKeyExchangeCoordinator`):
+
+- The request and response introduce each side's X25519 and Ed25519 keys. Intermediate hops cannot alter or swap them in transit, because the binding, the MAC and the signature cover them.
+- After first contact, a hop cannot substitute keys. A different signing key is refused and reported, and a different X25519 key raises the chat TOFU key-change event, exactly as for a direct peer.
+- Replays are refused: envelopes are deduplicated and expire, each nonce is accepted once, and a response must answer our outstanding request.
+- **Limit (by design of any first contact without a prior shared secret):** if a malicious device is the *only* path at the very first contact, it can introduce its own keys to both sides. This cannot be prevented automatically, but it is detectable. The safety code on the security-code screen then differs between the two devices, so comparing it in person or on a call exposes the attacker.
 
 ## Loop and Amplification Prevention
 

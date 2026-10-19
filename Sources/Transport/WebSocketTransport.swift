@@ -212,10 +212,13 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// what the discovery-stage placeholder used to leak through).
     public var authoritativePoolName: String? { currentPoolInfo?.name }
 
+    /// The host's peer ID as the relay reports it (base64 of the host identity key).
+    public var hostPeerID: String? { currentPoolInfo?.hostPeerId }
+
     // MARK: - Host State
 
     /// The host identity used for authentication (only set when hosting).
-    private var hostIdentity: RemoteHostIdentity?
+    var hostIdentity: RemoteHostIdentity?
 
     /// The pool ID being hosted or joined.
     private var poolID: UUID?
@@ -226,13 +229,13 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     // MARK: - Client State
 
     /// Parsed invitation for joining a pool.
-    private var joinInvitation: ParsedInvitation?
+    var joinInvitation: ParsedInvitation?
 
     /// Persistent member identity scoped to the active `(serverURL, poolID)`.
     /// Set whenever a join or rejoin is initiated and reused for the lifetime
     /// of the WebSocket task so the public key advertised in `JoinRequest` /
     /// `MemberRejoin` is stable across reconnect attempts.
-    private var memberIdentity: RemoteMemberIdentity?
+    var memberIdentity: RemoteMemberIdentity?
 
     /// Display name persisted alongside the member record. Captured once at
     /// connect time so a `Leave Pool` purge never has to re-derive it.
@@ -266,7 +269,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     private var intentionalDisconnect: Bool = false
 
     /// The role of this transport (host or client) for reconnection context.
-    private var isHostRole: Bool = false
+    var isHostRole: Bool = false
 
     /// Whether the server reported it is unclaimed. Suppresses HostAuth retries
     /// and keeps the connection alive for the claim flow.
@@ -349,6 +352,82 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             return nil
         }
         return plaintext
+    }
+
+    // MARK: - Outer Layer v2 (pool transport secret)
+
+    /// Distributes the pool transport secret and applies the v2 outer layer
+    /// (``OuterFrameV2``) once a remote session exists. See ``PoolTransportSecurity``.
+    private(set) var transportSecurity: PoolTransportSecurity?
+
+    /// Drives the security timers (retries, rotation switch, legacy detection).
+    private var securityTickTask: Task<Void, Never>?
+
+    /// Current state of the outer layer, for the UI.
+    public private(set) var outerLayerStatus: OuterLayerStatus = .off {
+        didSet { if outerLayerStatus != oldValue { onOuterLayerStatusChange?(outerLayerStatus) } }
+    }
+
+    /// Called on the main actor whenever ``outerLayerStatus`` changes.
+    public var onOuterLayerStatusChange: (@MainActor (OuterLayerStatus) -> Void)?
+
+    /// Sends a relay payload exactly as given (already sealed, a control frame, or a
+    /// plaintext frame in an unprotected pool). Every byte this transport hands to the
+    /// relay for peer traffic goes through here.
+    private func forwardRaw(_ data: Data, to targets: [String]?) {
+        if let targets, targets.isEmpty { return }
+        sendFrame(.forward(ForwardData(data: data.base64EncodedString(), targetPeerIds: targets, sequence: nextSequence())))
+    }
+
+    private func installSecurity(_ security: PoolTransportSecurity) {
+        transportSecurity = security
+        security.onStatusChange = { [weak self] status in
+            self?.outerLayerStatus = status
+        }
+        outerLayerStatus = security.status
+        securityTickTask?.cancel()
+        securityTickTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { break }
+                await MainActor.run { [weak self] in self?.transportSecurity?.tick() }
+            }
+        }
+    }
+
+    private func makeHostSecurity(poolID: UUID, identity: RemoteHostIdentity) -> PoolTransportSecurity {
+        PoolTransportSecurity(
+            hostIdentity: identity.privateKey, poolID: poolID,
+            localPeerID: { [weak self] in self?.localPeerID ?? "" },
+            send: { [weak self] data, targets in self?.forwardRaw(data, to: targets) },
+            deliver: { [weak self] data, sender in
+                guard let self else { return }
+                self.delegate?.transport(self, didReceiveData: data, from: sender)
+            }
+        )
+    }
+
+    private func makeMemberSecurity(poolID: UUID, identity: RemoteMemberIdentity, invite: TransportInviteSecret?) -> PoolTransportSecurity {
+        PoolTransportSecurity(
+            memberIdentity: identity.privateKey, serverURL: configuration.serverURL.absoluteString,
+            poolID: poolID, invite: invite,
+            localPeerID: { [weak self] in self?.localPeerID ?? "" },
+            send: { [weak self] data, targets in self?.forwardRaw(data, to: targets) },
+            deliver: { [weak self] data, sender in
+                guard let self else { return }
+                self.delegate?.transport(self, didReceiveData: data, from: sender)
+            }
+        )
+    }
+
+    /// Host only: creates the out-of-band invite material for a new invitation and
+    /// remembers its invite key until `expiresAt`. Append ``TransportInviteSecret/fragment``
+    /// to the invitation URL; it must never be sent to the relay.
+    public func makeInviteSecret(expiresAt: Date) -> TransportInviteSecret? {
+        guard isHostRole, let identity = hostIdentity, let security = transportSecurity else { return nil }
+        let secret = TransportInviteSecret.generate(hostIdentityKey: identity.publicKeyData)
+        security.registerInvite(secret, expiresAt: expiresAt)
+        return secret
     }
 
     // MARK: - Receive Loop
@@ -438,6 +517,9 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             peerId: peerID,
             reason: "Removed by host"
         )))
+        // Rotate the pool transport secret so the removed member cannot read later
+        // traffic at the outer layer.
+        if isHostRole { transportSecurity?.memberRemoved(peerID) }
     }
 
     // MARK: - TransportProvider: Client Operations
@@ -568,6 +650,10 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     ///   - data: The data to broadcast.
     ///   - reliable: Ignored for WebSocket (always reliable/ordered).
     public func broadcast(_ data: Data, reliable: Bool) {
+        if let transportSecurity {
+            transportSecurity.sendApp(data, to: nil)
+            return
+        }
         // Fail-closed: a nil result means encryption was required but failed — drop.
         guard let wireData = encryptForWS(data) else { return }
         let base64 = wireData.base64EncodedString()
@@ -586,6 +672,10 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     ///   - reliable: Ignored for WebSocket (always reliable/ordered).
     public func send(_ data: Data, to peerIDs: [String], reliable: Bool) {
         guard !peerIDs.isEmpty else { return }
+        if let transportSecurity {
+            transportSecurity.sendApp(data, to: peerIDs)
+            return
+        }
         // Fail-closed: a nil result means encryption was required but failed — drop.
         guard let wireData = encryptForWS(data) else { return }
         let base64 = wireData.base64EncodedString()
@@ -698,6 +788,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     private func tearDown() {
         powTask?.cancel()
         powTask = nil
+        securityTickTask?.cancel()
+        securityTickTask = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
         reconnectTask?.cancel()
@@ -784,7 +876,14 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     // MARK: - Internal: Frame Sending
 
     /// Send a ``ServerFrame`` over the WebSocket connection.
+    /// Test seam (internal): sees the exact JSON text of every frame this transport sends,
+    /// before the socket. Used to prove the relay never receives the transport secret.
+    var outboundFrameObserver: (@MainActor (Data) -> Void)?
+
     private func sendFrame(_ frame: ServerFrame) {
+        if let outboundFrameObserver, let data = try? injectSessionToken(into: frame).toJSON() {
+            outboundFrameObserver(data)
+        }
         guard let task = webSocketTask else {
             logMessage("sendFrame: webSocketTask is nil, dropping frame")
             return
@@ -1100,6 +1199,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             logMessage("purgeMemberStateForCurrentPool: identity delete failed: \(error.localizedDescription)")
         }
         RemoteMemberRecordStore.remove(serverURL: serverKey, poolID: poolKey)
+        TransportSecurityStore().delete(account: TransportSecurityStore.memberAccount(serverURL: serverKey, poolID: poolID))
+        transportSecurity?.forgetMemberState()
         memberIdentity = nil
         memberHasJoinedThisSession = false
     }
@@ -1186,7 +1287,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     // MARK: - Internal: Frame Handling
 
     /// Handle a received ``ServerFrame`` from the server.
-    private func handleFrame(_ frame: ServerFrame) {
+    func handleFrame(_ frame: ServerFrame) {
         switch frame {
         case .authChallenge(let data):
             // SECURITY: H-3 -- Store the server-issued nonce for replay protection.
@@ -1209,6 +1310,9 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             // This ensures key exchange, message routing, and peer identity all align.
             if let identity = hostIdentity {
                 localPeerID = identity.publicKeyData.base64EncodedString()
+                if transportSecurity?.poolID != data.poolId {
+                    installSecurity(makeHostSecurity(poolID: data.poolId, identity: identity))
+                }
             }
             reconnectAttempt = 0
             updateState(.advertising)
@@ -1227,6 +1331,22 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             sessionToken = data.sessionToken
             localPeerID = data.peerId
             currentPoolInfo = data.poolInfo
+            if !isHostRole, let identity = memberIdentity {
+                if transportSecurity?.poolID != data.poolInfo.poolId {
+                    installSecurity(makeMemberSecurity(poolID: data.poolInfo.poolId, identity: identity,
+                                                       invite: joinInvitation?.transportSecret))
+                }
+                transportSecurity?.connected(hostPeerID: data.poolInfo.hostPeerId)
+                if outerLayerStatus == .hostIdentityMismatch {
+                    logMessage("[SECURITY] The relay's host for this pool is not the host named in the invitation; disconnecting")
+                    let error = TransportError.underlying(WrappedError(message: "This pool's host could not be verified. The invitation does not match the host on the server."))
+                    intentionalDisconnect = true
+                    tearDown()
+                    updateState(.failed(error))
+                    delegate?.transport(self, didFailWithError: error)
+                    return
+                }
+            }
             reconnectAttempt = 0
             memberHasJoinedThisSession = true
             updateState(.connected)
@@ -1318,15 +1438,19 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                 connectedAt: Date(timeIntervalSince1970: TimeInterval(data.peer.connectedAt))
             )
             connectedPeers[data.peer.peerId] = peer
+            transportSecurity?.peerJoined(data.peer.peerId)
             delegate?.transport(self, peerDidConnect: peer)
 
         case .peerLeft(let data):
             connectedPeers.removeValue(forKey: data.peerId)
+            transportSecurity?.peerLeft(data.peerId)
             delegate?.transport(self, peerDidDisconnect: data.peerId)
 
         case .relayed(let data):
             // Decode base64 data, decrypt if E2E encryption is active, and deliver to delegate
-            if let rawData = Data(base64Encoded: data.data) {
+            if let rawData = Data(base64Encoded: data.data), let transportSecurity {
+                transportSecurity.receive(rawData, from: data.fromPeerId)
+            } else if let rawData = Data(base64Encoded: data.data) {
                 if let plaintext = decryptFromWS(rawData) {
                     delegate?.transport(self, didReceiveData: plaintext, from: data.fromPeerId)
                 }
