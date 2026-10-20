@@ -85,7 +85,7 @@ public final class SocketConnection: RawConnection, @unchecked Sendable {
     ) async throws -> SocketConnection {
         let conn = NWConnection(to: endpoint, using: parameters)
         let queue = DispatchQueue(label: "ConnectionPool.SocketConnection.connect")
-        connectLog.info("connect: starting to endpoint=\(String(describing: endpoint), privacy: .public)")
+        connectLog.info("connect: starting to endpoint=\(String(describing: endpoint), privacy: .private)")
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask {

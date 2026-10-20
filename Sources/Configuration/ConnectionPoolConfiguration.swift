@@ -83,6 +83,23 @@ public enum ConnectionPoolConfiguration {
         set { PoolDesign.shared.iconRenderer = newValue }
     }
 
+    // MARK: - Secure copy seam
+
+    /// Copies a secret (recovery key, pool join code, decrypted chat text) to the
+    /// system pasteboard. The host wires its own secure pasteboard here, e.g.
+    ///
+    ///     ConnectionPoolConfiguration.secureCopy = { value, kind in
+    ///         SecurePasteboard.copy(value, expiresIn: kind.expiry)
+    ///     }
+    ///
+    /// The handler must keep the item off Universal Clipboard (`.localOnly`) and
+    /// expire it no later than `kind.expiry`. When nil, ConnectionPool and PoolChat
+    /// use `PoolClipboard.defaultSecureCopy`, which does exactly that.
+    @MainActor public static var secureCopy: PoolClipboard.SecureCopyHandler? {
+        get { PoolClipboard.secureCopyHandler }
+        set { PoolClipboard.secureCopyHandler = newValue }
+    }
+
     /// Notify the pool UI that the theme, appearance, or language changed so it
     /// re-renders. The host calls this on any `ThemeEngine` / `LanguageEngine`
     /// change.

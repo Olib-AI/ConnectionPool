@@ -326,7 +326,10 @@ public actor CrossPlatformPool {
             case .failure(let failurePayload):
                 await raw.close()
                 let tag = CrossPlatformTransportError.fromWireOrIncompatible(failurePayload.err) { unknown in
-                    print("[ConnectionPool] connectAsGuest: unknown server_hello.err='\(unknown)' (treating as INCOMPATIBLE per ADR-0004 §2.6)")
+                    // `unknown` is peer-controlled text: logged through the package logger,
+                    // which keeps message content private by default.
+                    log("connectAsGuest: unknown server_hello.err='\(unknown)' (treating as INCOMPATIBLE per ADR-0004 §2.6)",
+                        level: .warning, category: .network)
                 }
                 let messageOut = CrossPlatformTransportError.fromWire(failurePayload.err) != nil
                     ? failurePayload.err

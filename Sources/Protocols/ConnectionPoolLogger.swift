@@ -59,6 +59,8 @@ public protocol ConnectionPoolLogger: Sendable {
 
 /// Default logger implementation using Apple's os.Logger framework.
 /// Used when no external logger is injected via ConnectionPoolConfiguration.
+/// Messages carry peer names, hosts and peer-controlled text, so they are
+/// `.private`: redacted in logs unless a debugger or profile reveals them.
 private struct DefaultOSLogger: ConnectionPoolLogger {
     private static let subsystem = "ai.olib.connectionpool"
 
@@ -76,15 +78,15 @@ private struct DefaultOSLogger: ConnectionPoolLogger {
 
         switch level {
         case .debug:
-            logger.debug("\(formattedMessage)")
+            logger.debug("\(formattedMessage, privacy: .private)")
         case .info:
-            logger.info("\(formattedMessage)")
+            logger.info("\(formattedMessage, privacy: .private)")
         case .warning:
-            logger.warning("\(formattedMessage)")
+            logger.warning("\(formattedMessage, privacy: .private)")
         case .error:
-            logger.error("\(formattedMessage)")
+            logger.error("\(formattedMessage, privacy: .private)")
         case .critical:
-            logger.critical("\(formattedMessage)")
+            logger.critical("\(formattedMessage, privacy: .private)")
         }
     }
 }

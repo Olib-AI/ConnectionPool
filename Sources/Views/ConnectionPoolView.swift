@@ -14,18 +14,6 @@ import AppKit
 
 // MARK: - Cross-Platform Helpers
 
-/// Cross-platform clipboard helper
-private enum CrossPlatformClipboard {
-    static func copyToClipboard(_ string: String) {
-        #if canImport(UIKit)
-        UIPasteboard.general.string = string
-        #elseif canImport(AppKit)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
-        #endif
-    }
-}
-
 /// Cross-platform text field modifier
 private struct CrossPlatformTextFieldModifiers: ViewModifier {
     let autocapitalization: Bool
@@ -1024,7 +1012,8 @@ private struct PoolCodeCard: View {
                 .foregroundColor(theme.textPrimary)
 
             Button {
-                CrossPlatformClipboard.copyToClipboard(code)
+                // The join code admits peers and keys the pool's relay integrity secret.
+                PoolClipboard.copySecret(code, kind: .inviteSecret)
                 copied = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                     copied = false
@@ -2294,7 +2283,7 @@ private struct InvitePeersSheet: View {
                             .foregroundColor(theme.textPrimary)
 
                         Button {
-                            CrossPlatformClipboard.copyToClipboard(poolCode)
+                            PoolClipboard.copySecret(poolCode, kind: .inviteSecret)
                         } label: {
                             HStack(spacing: theme.spacingXS + 2) {
                                 PoolIcon("copy", size: 14, systemFallback: "doc.on.doc")
@@ -2969,7 +2958,8 @@ private struct RecoveryKeySheet: View {
                         .frame(maxWidth: .infinity)
                         .background(theme.surfaceSecondary)
                         .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
-                        .textSelection(.enabled)
+                        // No `.textSelection`: the system Copy it offers writes the key to
+                        // Universal Clipboard with no expiry. Copy goes through the button.
                         .padding(.horizontal)
 
                     // Save to Password Manager
@@ -3015,9 +3005,7 @@ private struct RecoveryKeySheet: View {
 
                     // Copy to Clipboard
                     Button {
-                        #if canImport(UIKit)
-                        UIPasteboard.general.string = key
-                        #endif
+                        PoolClipboard.copySecret(key, kind: .recoveryKey)
                         hasCopied = true
                     } label: {
                         HStack(spacing: theme.spacingS) {
