@@ -448,10 +448,60 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     public override init() {
         super.init()
-        setupPeerID()
+        // The profile first: the MultipeerConnectivity peer name is the pool display name.
         loadProfile()
+        setupPeerID()
         loadFailedAttemptCounts()
         setupMeshRelayService()
+        egressObserver = NotificationCenter.default.addObserver(
+            forName: PoolEgress.routeDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleEgressRouteChange()
+            }
+        }
+    }
+
+    // MARK: - Local Presence (Docs/NETWORK_EGRESS.md)
+
+    /// Why local discovery is not running, for the pool UI (nil: nothing to report).
+    @Published public private(set) var localPresenceNotice: LocalPresenceNotice?
+
+    /// Observer for `PoolEgress.routeDidChange`.
+    private var egressObserver: (any NSObjectProtocol)?
+
+    /// MultipeerConnectivity is advertising, browsing or holding a local session.
+    public var isLocalPresenceActive: Bool {
+        advertiser != nil || browser != nil || relayAdvertiser != nil || relayBrowser != nil
+            || relaySession != nil || (session != nil && remotePeerID == nil)
+    }
+
+    public func clearLocalPresenceNotice() {
+        localPresenceNotice = nil
+    }
+
+    /// LAN PRESENCE INVARIANT: MultipeerConnectivity advertises this device to everyone on
+    /// the local network and talks to peers directly - no proxy can hide that. While the
+    /// host app reports Tor / a proxy / a relay, nothing local starts unless the user
+    /// accepted that exposure for this start (`PoolEgress.grantLocalPresenceConsent()`).
+    private func admitLocalPresence(_ action: String) -> Bool {
+        guard PoolEgress.mayUseLocalNetwork else {
+            log("LOCAL PRESENCE BLOCKED: \(action) refused - an anonymity regime is active and the user has not accepted local exposure", level: .warning, category: .network)
+            localPresenceNotice = .blockedByRegime
+            return false
+        }
+        return true
+    }
+
+    /// A regime that turns on stops every local presence at once (advertising, browsing,
+    /// sessions) and tells the user. Consent given before does not carry over.
+    func handleEgressRouteChange() {
+        guard PoolEgress.isAnonymityRegimeActive, !PoolEgress.mayUseLocalNetwork, isLocalPresenceActive else { return }
+        log("LOCAL PRESENCE STOPPED: an anonymity regime became active", level: .warning, category: .network)
+        disconnect()
+        localPresenceNotice = .stoppedBecauseRegimeActivated
     }
 
     /// Points a relay service at a pool and gives it the pool's integrity secret. Every
@@ -474,22 +524,18 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     }
 
     private func setupPeerID() {
-        // Use device name or generate a unique name.
-        // PERF FIX: Avoid Host.current().localizedName entirely — it performs a synchronous
-        // reverse DNS lookup that can block for 5-6 seconds on the main thread.
-        // ProcessInfo.hostName is fast (no DNS) and sufficient for peer identification.
-        #if canImport(UIKit)
-        let displayName = UIDevice.current.name
-        #else
-        let hostName = ProcessInfo.processInfo.hostName
-        let displayName: String
-        if !hostName.isEmpty && hostName != "localhost" {
-            displayName = hostName
-        } else {
-            displayName = "Mac User"
-        }
-        #endif
-        self.peerID = MCPeerID(displayName: displayName)
+        // PRIVACY: the MultipeerConnectivity peer name is broadcast to every nearby device
+        // (it is the Bonjour instance name). It is the pool display name the user chose,
+        // never the device name, model or host name.
+        self.peerID = MCPeerID(displayName: Self.peerDisplayName(from: localProfile.displayName))
+    }
+
+    /// A valid MCPeerID name (non-empty, at most 63 UTF-8 bytes) from the profile name.
+    static func peerDisplayName(from profileName: String) -> String {
+        let trimmed = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var name = trimmed.isEmpty ? "Pool Member" : trimmed
+        while name.utf8.count > 63 { name.removeLast() }
+        return name
     }
 
     /// Load user profile from UserDefaults (synchronous for immediate access)
@@ -652,6 +698,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Start hosting a new connection pool
     public func startHosting(configuration: PoolConfiguration = .default) {
+        guard admitLocalPresence("hosting") else { return }
         // If not idle, force cleanup first to prevent stale MC state
         if poolState != .idle {
             log("startHosting called while not idle (state: \(poolState)), forcing cleanup", level: .warning, category: .network)
@@ -759,6 +806,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Start browsing for available pools
     public func startBrowsing() {
+        guard admitLocalPresence("browsing") else { return }
         // If not idle, force cleanup first to prevent stale MC state
         if poolState != .idle {
             log("startBrowsing called while not idle (state: \(poolState)), forcing cleanup", level: .warning, category: .network)
@@ -821,6 +869,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     ///   - poolCode: The pool code entered by the user, if the pool requires one.
     ///              Sent as invitation context and validated host-side.
     public func joinPool(_ peer: DiscoveredPeer, poolCode: String? = nil) {
+        guard admitLocalPresence("joining") else { return }
         guard poolState == .browsing else {
             log("Cannot join pool: not in browsing state", category: .network)
             return
@@ -1339,6 +1388,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// conflicts and DTLS "No route to host" errors. Using a separate service type and session
     /// eliminates this entirely.
     public func startRelayAdvertising() {
+        guard admitLocalPresence("relay advertising") else { return }
         // Detailed logging to diagnose which guard condition fails
         if poolState != .connected && poolState != .hosting {
             log("Relay advertising guard failed: poolState is \(poolState), expected .connected or .hosting", level: .warning, category: .network)

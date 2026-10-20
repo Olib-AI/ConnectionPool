@@ -101,7 +101,11 @@ public final class BonjourAdvertiser: @unchecked Sendable {
         self.listener = listener
     }
 
-    public func start(onConnection: @escaping @Sendable (NWConnection) -> Void) {
+    /// Starts advertising. Returns false (nothing advertised) while an anonymity regime is
+    /// active without the user's consent: see `PoolEgress`.
+    @discardableResult
+    public func start(onConnection: @escaping @Sendable (NWConnection) -> Void) -> Bool {
+        guard PoolEgress.mayUseLocalNetwork else { return false }
         self.onConnection = onConnection
         listener.newConnectionHandler = { [weak self] conn in
             guard let self else {
@@ -111,6 +115,7 @@ public final class BonjourAdvertiser: @unchecked Sendable {
             self.onConnection?(conn)
         }
         listener.start(queue: queue)
+        return true
     }
 
     public func stop() {

@@ -115,6 +115,21 @@ public struct ConnectionPoolView: View {
                     Text(error)
                 }
             }
+            .alert(poolString("connectionpool.localExposure.title", fallback: "Nearby devices will see this phone"), isPresented: $viewModel.showLocalExposureWarning) {
+                Button(poolString("connectionpool.localExposure.confirm", fallback: "Start Anyway"), role: .destructive) {
+                    viewModel.confirmLocalExposure()
+                }
+                Button(poolString("common.cancel", fallback: "Cancel"), role: .cancel) {
+                    viewModel.cancelLocalExposure()
+                }
+            } message: {
+                Text(poolString("connectionpool.localExposure.message", fallback: "Tor, a proxy or the relay is on, but a local pool talks directly to nearby devices over Wi-Fi and Bluetooth. They will see this phone and its pool name on the local network. Nothing in a local pool goes through Tor or the proxy."))
+            }
+            .alert(poolString("connectionpool.localExposure.stoppedTitle", fallback: "Local pool stopped"), isPresented: $viewModel.showLocalPresenceStopped) {
+                Button(poolString("common.ok", fallback: "OK"), role: .cancel) {}
+            } message: {
+                Text(poolString("connectionpool.localExposure.stoppedMessage", fallback: "Tor, a proxy or the relay was turned on. A local pool talks directly to nearby devices, so it was stopped to keep this phone hidden. You can start it again and accept the exposure."))
+            }
 
             // Join code overlay - always in view hierarchy when condition is true
             // This ZStack approach is 100% reliable because it's just conditional view rendering

@@ -82,6 +82,21 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     @Published public var errorMessage: String?
     @Published public var showError: Bool = false
 
+    // MARK: - Local Presence (Docs/NETWORK_EGRESS.md)
+
+    /// A local start that waits for the user to accept local-network exposure while Tor / a
+    /// proxy / the relay is on.
+    public enum PendingLocalAction: Sendable, Equatable {
+        case host
+        case browse
+    }
+
+    /// Shows the "nearby devices will see this phone" warning.
+    @Published public var showLocalExposureWarning: Bool = false
+    @Published public private(set) var pendingLocalAction: PendingLocalAction?
+    /// Shows "the local pool was stopped because a regime turned on".
+    @Published public var showLocalPresenceStopped: Bool = false
+
     /// Callback for opening Pool Chat app
     public var onOpenPoolChat: (() -> Void)?
 
@@ -340,6 +355,21 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     }
 
     private func setupSubscriptions() {
+        poolManager.$localPresenceNotice
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notice in
+                guard let self, let notice else { return }
+                switch notice {
+                case .stoppedBecauseRegimeActivated:
+                    self.currentView = .home
+                    self.showLocalPresenceStopped = true
+                case .blockedByRegime:
+                    break
+                }
+                self.poolManager.clearLocalPresenceNotice()
+            }
+            .store(in: &cancellables)
+
         // Subscribe to pool state changes and mirror to our published property
         poolManager.$poolState
             .receive(on: DispatchQueue.main)
@@ -474,6 +504,7 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Explicitly disconnect from the pool. Call this when user wants to leave.
     public func explicitDisconnect() {
+        PoolEgress.revokeLocalPresenceConsent()
         if transportMode == .remote {
             webSocketTransport?.disconnect()
             webSocketTransport = nil
@@ -506,6 +537,7 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             showError(message: "Please enter a pool name")
             return
         }
+        guard admitLocalStart(.host) else { return }
 
         let config = PoolConfiguration(
             name: poolName,
@@ -521,8 +553,35 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
 
     /// Start browsing for pools
     public func startBrowsing() {
+        guard admitLocalStart(.browse) else { return }
         poolManager.startBrowsing()
         currentView = .browse
+    }
+
+    /// While Tor / a proxy / the relay is on, a local pool starts only after the user has
+    /// seen that nearby devices will reach this phone directly.
+    private func admitLocalStart(_ action: PendingLocalAction) -> Bool {
+        guard !PoolEgress.mayUseLocalNetwork else { return true }
+        pendingLocalAction = action
+        showLocalExposureWarning = true
+        return false
+    }
+
+    /// The user accepted local-network exposure for this start.
+    public func confirmLocalExposure() {
+        guard let action = pendingLocalAction else { return }
+        pendingLocalAction = nil
+        showLocalExposureWarning = false
+        PoolEgress.grantLocalPresenceConsent()
+        switch action {
+        case .host: startHosting()
+        case .browse: startBrowsing()
+        }
+    }
+
+    public func cancelLocalExposure() {
+        pendingLocalAction = nil
+        showLocalExposureWarning = false
     }
 
     /// Refresh browsing (restart scanning)

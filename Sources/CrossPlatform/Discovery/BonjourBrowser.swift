@@ -41,7 +41,11 @@ public final class BonjourBrowser: @unchecked Sendable {
     /// Begin browsing `_chessup-pvp._tcp` services in the local domain.
     /// `onChange` is invoked with the full current snapshot of discovered
     /// services every time a TXT/endpoint update arrives.
-    public func start(onChange: @escaping @Sendable ([DiscoveredService]) -> Void) {
+    /// Starts browsing. Returns false (no mDNS query sent) while an anonymity regime is
+    /// active without the user's consent: see `PoolEgress`.
+    @discardableResult
+    public func start(onChange: @escaping @Sendable ([DiscoveredService]) -> Void) -> Bool {
+        guard PoolEgress.mayUseLocalNetwork else { return false }
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
         // `NWBrowser.Descriptor.bonjour(type:domain:)` discovers
@@ -79,6 +83,7 @@ public final class BonjourBrowser: @unchecked Sendable {
         }
         browser.start(queue: queue)
         self.browser = browser
+        return true
     }
 
     public func stop() {

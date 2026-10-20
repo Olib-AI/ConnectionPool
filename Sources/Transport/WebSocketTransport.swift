@@ -15,19 +15,47 @@ import Security
 /// on TLS connections. When a pin hash is configured, only servers whose leaf certificate's
 /// SPKI matches the expected hash are accepted. When no pin is configured (e.g., local/dev mode),
 /// standard system CA validation is used as a fallback.
-final class PinnedSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+final class PinnedSessionDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate, @unchecked Sendable {
 
     /// The expected SHA-256 hash of the server's leaf certificate SPKI, as raw bytes.
     /// When `nil`, standard CA validation applies (no pinning).
     private let expectedSPKIHash: Data?
 
+    /// Credentials for the HTTP CONNECT proxy the host app routes through (its router),
+    /// answered only to a proxy challenge - never sent to the relay server.
+    private let proxyCredential: URLCredential?
+
     /// Creates a pinned session delegate.
     ///
     /// - Parameter expectedSPKIHash: SHA-256 hash of the expected server SPKI, or `nil` to
     ///   fall back to standard system TLS validation.
-    init(expectedSPKIHash: Data? = nil) {
+    init(expectedSPKIHash: Data? = nil, proxyCredential: URLCredential? = nil) {
         self.expectedSPKIHash = expectedSPKIHash
+        self.proxyCredential = proxyCredential
         super.init()
+    }
+
+    /// Proxy authentication (the CONNECT to the router); everything else as for the session.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if challenge.protectionSpace.isProxy() {
+            // One attempt only: a rejected credential must not loop.
+            guard let proxyCredential, challenge.previousFailureCount == 0 else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+            completionHandler(.useCredential, proxyCredential)
+            return
+        }
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
+            urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
     }
 
     func urlSession(
@@ -193,6 +221,19 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
 
     /// The active WebSocket task.
     private var webSocketTask: URLSessionWebSocketTask?
+
+    /// The route the current connection uses (`PoolEgress`), re-checked when routing changes.
+    private(set) var currentRoute: PoolNetworkRoute?
+
+    /// The last connect was refused by the host app's routing policy; a routing change
+    /// that allows it again reconnects.
+    private var blockedByRoute = false
+
+    /// Observer for `PoolEgress.routeDidChange`.
+    private var egressObserver: (any NSObjectProtocol)?
+
+    /// The relay server this transport talks to.
+    public var serverURL: URL { configuration.serverURL }
 
     /// Session token received from the server for reconnection.
     private(set) var sessionToken: String?
@@ -452,6 +493,15 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         self.localPeerName = displayName
         self.localPeerID = peerID ?? UUID().uuidString
         super.init()
+        egressObserver = NotificationCenter.default.addObserver(
+            forName: PoolEgress.routeDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleEgressRouteChange()
+            }
+        }
     }
 
     deinit {
@@ -755,16 +805,33 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         let url = configuration.serverURL
         logMessage("WebSocket connecting to \(url.host ?? "unknown"):\(url.port ?? 0)")
 
+        // EGRESS (PoolEgress): the host app decides the route on every (re)connect - its
+        // authenticated router under Tor / a proxy, directly otherwise, or not at all.
+        let route = PoolEgress.route(for: url)
+        currentRoute = route
+        if case .blocked(let reason) = route {
+            logMessage("[EGRESS] WebSocket connect blocked by routing policy: \(reason)")
+            blockedByRoute = true
+            let error = TransportError.underlying(WrappedError(message: reason))
+            updateState(.failed(error))
+            delegate?.transport(self, didFailWithError: error)
+            return
+        }
+        blockedByRoute = false
+
         // SECURITY: Use ephemeral configuration to avoid caching credentials,
         // cookies, or connection metadata to disk. A privacy-focused app must not
         // persist WebSocket connection artifacts.
         //
         // SECURITY: Attach PinnedSessionDelegate for SPKI certificate pinning when a
         // pin hash is configured. This prevents MITM attacks even if a rogue CA issues
-        // a certificate for the relay server's domain.
-        let pinDelegate = PinnedSessionDelegate(expectedSPKIHash: configuration.pinnedSPKIHash)
+        // a certificate for the relay server's domain. Through a proxy the TLS session
+        // still runs end to end inside the CONNECT tunnel, so the pin is checked against
+        // the relay server itself.
+        let (sessionConfiguration, proxyCredential) = Self.sessionConfiguration(for: route, identityHeaders: PoolEgress.regimeIdentityHeaders)
+        let pinDelegate = PinnedSessionDelegate(expectedSPKIHash: configuration.pinnedSPKIHash, proxyCredential: proxyCredential)
         let session = URLSession(
-            configuration: .ephemeral,
+            configuration: sessionConfiguration,
             delegate: pinDelegate,
             delegateQueue: nil
         )
@@ -808,6 +875,63 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         // Clear auth challenge state so a fresh nonce is required on reconnect.
         authChallengeNonce = nil
         pendingHostAuthPoolInfo = nil
+    }
+
+    /// The ephemeral session configuration for a route, and the credential to answer the
+    /// proxy's challenge with. The credential is never an additional header: CONNECT is
+    /// authenticated through the challenge, so nothing sent inside the tunnel can carry it.
+    static func sessionConfiguration(
+        for route: PoolNetworkRoute,
+        identityHeaders: [String: String]
+    ) -> (URLSessionConfiguration, URLCredential?) {
+        let configuration = URLSessionConfiguration.ephemeral
+        guard case .httpProxy(let host, let port, let username, let password) = route else {
+            configuration.connectionProxyDictionary = [:]
+            return (configuration, nil)
+        }
+        configuration.connectionProxyDictionary = proxyDictionary(host: host, port: port)
+        if !identityHeaders.isEmpty {
+            configuration.httpAdditionalHeaders = identityHeaders
+        }
+        return (configuration, URLCredential(user: username, password: password, persistence: .forSession))
+    }
+
+    /// CFNetwork keys for an HTTP proxy used for both ws (HTTP) and wss (CONNECT).
+    static func proxyDictionary(host: String, port: Int) -> [AnyHashable: Any] {
+        [
+            "HTTPEnable": 1, "HTTPProxy": host, "HTTPPort": port,
+            "HTTPSEnable": 1, "HTTPSProxy": host, "HTTPSPort": port,
+        ]
+    }
+
+    /// Routing changed in the host app: a connection whose route is no longer the right one
+    /// (direct -> router when Tor turns on, router -> blocked on the kill switch) is torn
+    /// down and reconnected through the new route; one refused earlier is retried.
+    func handleEgressRouteChange() {
+        guard !intentionalDisconnect else { return }
+        let route = PoolEgress.route(for: configuration.serverURL)
+        if blockedByRoute {
+            if case .blocked = route { return }
+            logMessage("[EGRESS] Route available again - reconnecting")
+            reconnectAttempt = 0
+            tearDown()
+            attemptReconnect()
+            return
+        }
+        guard let currentRoute, currentRoute != route else { return }
+        switch state {
+        case .connecting, .connected, .reconnecting:
+            logMessage("[EGRESS] Route changed - reconnecting through the new route")
+            reconnectAttempt = 0
+            tearDown()
+            if case .blocked = route {
+                connect { }
+            } else {
+                attemptReconnect()
+            }
+        default:
+            break
+        }
     }
 
     /// Attempt to reconnect with exponential backoff.
