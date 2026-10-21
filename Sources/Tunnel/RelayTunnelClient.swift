@@ -515,15 +515,23 @@ public actor RelayTunnelClient: RelayTunnelClientType {
 
     // MARK: Frame handlers
 
+    /// Posts the kill-switch notification on the main actor: its observers live in
+    /// @MainActor types, and Swift 6 traps a main-actor closure run on this actor.
+    private static func postKillSwitch() {
+        Task { @MainActor in
+            NotificationCenter.default.post(
+                name: Notification.Name("RelayTunnelKillSwitchTriggered"),
+                object: nil
+            )
+        }
+    }
+
     private func handleClose(_ c: TunnelCloseData) {
         if c.reason == .policyDenied {
             // Trip the kill switch — the relay or host explicitly refused. The Core layer
             // listens for `relayTunnelKillSwitchTriggered` and the user-facing message lives
             // in `RelayTunnelError.policyDenied`.
-            NotificationCenter.default.post(
-                name: Notification.Name("RelayTunnelKillSwitchTriggered"),
-                object: nil
-            )
+            Self.postKillSwitch()
         }
         streams[c.streamId]?.didReceiveClose(reason: c.reason)
         streams.removeValue(forKey: c.streamId)
@@ -532,10 +540,7 @@ public actor RelayTunnelClient: RelayTunnelClientType {
     private func handleError(_ e: TunnelErrorData) {
         let mapped = mapTunnelError(e)
         if e.code == .policyDenied {
-            NotificationCenter.default.post(
-                name: Notification.Name("RelayTunnelKillSwitchTriggered"),
-                object: nil
-            )
+            Self.postKillSwitch()
         }
         if let streamId = e.streamId {
             streams[streamId]?.didReceiveError(mapped)
