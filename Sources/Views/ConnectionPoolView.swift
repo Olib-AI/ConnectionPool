@@ -96,6 +96,11 @@ public struct ConnectionPoolView: View {
             .sheet(isPresented: $viewModel.showBlockedDevicesSheet) {
                 BlockedDevicesSheet(viewModel: viewModel)
             }
+            .alert(poolString("connectionpool.poolClosed.title", fallback: "Pool closed"), isPresented: $viewModel.showPoolEndedNotice) {
+                Button(poolString("common.ok", fallback: "OK"), role: .cancel) {}
+            } message: {
+                Text(viewModel.poolEndedMessage)
+            }
             .alert(poolString("connectionpool.error.title", fallback: "Error"), isPresented: $viewModel.showError) {
                 Button(poolString("common.ok", fallback: "OK"), role: .cancel) {}
             } message: {
@@ -1697,8 +1702,9 @@ private struct QuickActionsCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: theme.radiusMedium, style: .continuous))
             }
 
-            // Games button
+            // Games button (only while the pool is live)
             Button {
+                guard viewModel.poolState == .connected || viewModel.poolState == .hosting else { return }
                 showGamesSheet = true
             } label: {
                 HStack {
@@ -1756,6 +1762,9 @@ private struct QuickActionsCard: View {
         .sheet(isPresented: $showGamesSheet) {
             GamesSelectionSheet(viewModel: viewModel)
         }
+        .onChange(of: viewModel.poolState) { _, state in
+            if state != .connected && state != .hosting { showGamesSheet = false }
+        }
     }
 }
 
@@ -1776,6 +1785,8 @@ private struct DisconnectControl: View {
         Button {
             if isRemoteMember {
                 showLeaveConfirmation = true
+            } else if viewModel.isHost {
+                viewModel.closePool()
             } else {
                 viewModel.disconnect()
             }

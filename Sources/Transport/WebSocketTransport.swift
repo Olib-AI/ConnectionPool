@@ -245,7 +245,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     private var connectedPeers: [String: TransportPeer] = [:]
 
     /// Pool info received after joining.
-    private var currentPoolInfo: ServerPoolInfo?
+    var currentPoolInfo: ServerPoolInfo?
 
     /// Authoritative pool name from the relay's most recent `JoinAccepted.pool_info`.
     /// Members read this when constructing their `PoolSession` so the displayed name

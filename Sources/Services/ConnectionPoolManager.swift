@@ -92,6 +92,26 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Publisher for peer connection events
     public let peerEvent = PassthroughSubject<PeerEvent, Never>()
 
+    /// Why a member's pool session ended on its own (the user did not leave).
+    public enum PoolEndReason: Sendable, Equatable {
+        /// The host closed the pool: a `.poolClosed` event, the relay's `close_pool`, or the
+        /// local host peer dropping off (the path a 1.4.x host takes, which sends no event).
+        case hostClosed
+        /// The last link into the pool was lost without a host signal.
+        case connectionLost
+    }
+
+    /// Fires after the manager has torn the pool down because it ended underneath a
+    /// member. Observers reset their own state, close games and tell the user.
+    public let poolEnded = PassthroughSubject<PoolEndReason, Never>()
+
+    /// Test seam: sees every broadcast message at the moment it is handed to the transport.
+    var sentMessageObserver: (@MainActor (PoolMessage) -> Void)?
+
+    /// How long the host waits for the local-session `.poolClosed` broadcast to leave the
+    /// radio before tearing the session down (MultipeerConnectivity has no send completion).
+    static let localCloseFlush: Duration = .milliseconds(400)
+
     // MARK: - Remote Transport Bridge
 
     /// When set, messages are sent via WebSocket instead of MultipeerConnectivity.
@@ -156,8 +176,76 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Inject a message received via WebSocket into the message pipeline.
     /// This makes PoolChat and games see it as if it arrived via MC.
-    public func injectReceivedMessage(_ message: PoolMessage) {
+    ///
+    /// - Parameter transportPeerID: The relay peer the transport received it from, when
+    ///   known. A `.poolClosed` event is honored only from the pool's host.
+    public func injectReceivedMessage(_ message: PoolMessage, from transportPeerID: String? = nil) {
+        if message.isPoolClosedEvent {
+            guard !isHost else { return }
+            let host = remoteTransport?.hostPeerID
+            guard let host, !host.isEmpty, message.senderID == host, transportPeerID == nil || transportPeerID == host else {
+                log("[POOL_CLOSED] Ignoring pool-closed event not from the host", level: .warning, category: .network)
+                return
+            }
+            endPoolAsMember(.hostClosed)
+            return
+        }
         messageReceived.send(message)
+    }
+
+    // MARK: - Pool end (member side) and close (host side)
+
+    /// Whether `peerID` is this pool's host: the session's host ID, or the roster flag.
+    func isHostPeer(_ peerID: String) -> Bool {
+        if let hostID = currentSession?.hostPeerID, !hostID.isEmpty, hostID == peerID { return true }
+        return connectedPeers.first(where: { $0.id == peerID })?.isHost == true
+    }
+
+    /// Ends a member's pool: tears everything down, then notifies observers. No-op for a
+    /// host (hosts close pools, they are never ended) or when no pool is active.
+    func endPoolAsMember(_ reason: PoolEndReason) {
+        guard !isHost, poolState != .idle || currentSession != nil else { return }
+        log("[POOL_END] Pool ended (\(reason))", category: .network)
+        disconnect()
+        poolEnded.send(reason)
+    }
+
+    /// A member lost a peer of its primary MultipeerConnectivity session (already removed
+    /// from the roster). The pool ends when that peer was the host, or when nobody but this
+    /// device is left; an ordinary member dropping off never ends it.
+    ///
+    /// The member's own entry is in `connectedPeers`, so "empty" means "only self remains".
+    func handlePrimaryPeerLost(peerID: String, wasHost: Bool) {
+        guard !isHost else { return }
+        let me = localPeerID
+        let othersRemain = connectedPeers.contains { $0.id != me }
+        guard wasHost || !othersRemain else { return }
+        if currentSession == nil {
+            // Never finished joining: the pre-existing behavior is a plain reset.
+            disconnect()
+        } else {
+            endPoolAsMember(wasHost ? .hostClosed : .connectionLost)
+        }
+    }
+
+    /// Host side of "Close Pool": tells every member the pool is closed, waits until that
+    /// has left (bounded), closes a remote pool on the relay, then tears down.
+    ///
+    /// Members of 1.4.x ignore the event and leave through their host-loss path; a remote
+    /// pool's guests also get the relay's own `kicked` frame.
+    public func closePoolAsHost() async {
+        guard isHost else {
+            disconnect()
+            return
+        }
+        let message = PoolMessage.poolClosed(from: localPeerID, senderName: localProfile.displayName)
+        sendMessage(message)
+        if let remote = remoteTransport {
+            await remote.closePool()
+        } else if !(session?.connectedPeers.isEmpty ?? true) || !(relaySession?.connectedPeers.isEmpty ?? true) {
+            try? await Task.sleep(for: Self.localCloseFlush)
+        }
+        disconnect()
     }
 
     /// Set remote pool state so games/chat see the pool as active.
@@ -963,6 +1051,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Send a message to all connected peers (primary session + relay session)
     public func sendMessage(_ message: PoolMessage) {
+        sentMessageObserver?(message)
         // If remote transport is active, send via WebSocket instead of MC.
         if let remote = remoteTransport {
             guard let data = message.encode() else { return }
@@ -1825,6 +1914,14 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         }
         relayBridgeDeduplicationCache.markProcessed(message.id)
 
+        // "Pool closed" is the host's alone: honored from the host, never bridged onward.
+        if message.isPoolClosedEvent {
+            if !isHost, message.senderID == currentSession?.hostPeerID {
+                endPoolAsMember(.hostClosed)
+            }
+            return
+        }
+
         // Bridge the message to all primary session peers (forwarding)
         // This is the core relay bridging: messages from relay peers are forwarded to pool peers
         messageReceived.send(message)
@@ -1945,7 +2042,11 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // If no primary peers either, disconnect entirely
         if connectedPeers.count <= 1 { // Only self in list
-            disconnect()
+            if currentSession == nil {
+                disconnect()
+            } else {
+                endPoolAsMember(.connectionLost)
+            }
         }
     }
 }
@@ -1968,6 +2069,8 @@ extension ConnectionPoolManager: MCSessionDelegate {
             case .notConnected:
                 let disconnectTime = Date()
                 log("[PEER_STATE] Peer disconnected: \(peerDisplayName) at \(disconnectTime) (epoch: \(String(format: "%.3f", disconnectTime.timeIntervalSince1970)))", category: .network)
+                let lostPeerID = peerIDMap[capturedPeerID] ?? peerDisplayName
+                let lostWasHost = isHostPeer(lostPeerID)
                 removeConnectedPeer(capturedPeerID)
 
                 // Notify mesh relay service of peer disconnection
@@ -1978,10 +2081,9 @@ extension ConnectionPoolManager: MCSessionDelegate {
                     poolState = .browsing
                 }
 
-                // If all peers disconnected and we're not host, go idle
-                if !isHost && connectedPeers.isEmpty {
-                    disconnect()
-                }
+                // A member leaves when the host is lost or nobody else is left. The roster
+                // holds this device's own entry, so "nobody else" ignores it.
+                handlePrimaryPeerLost(peerID: lostPeerID, wasHost: lostWasHost)
 
             case .connecting:
                 log("Peer connecting: \(peerDisplayName)", category: .network)
@@ -2157,6 +2259,18 @@ extension ConnectionPoolManager: MCSessionDelegate {
                 } else {
                     log("[MESH_RELAY] Failed to decode RelayEnvelope from primary peer \(peerDisplayName)", level: .warning, category: .network)
                 }
+            }
+
+            // The host's "pool closed" broadcast. Hosts never act on it (nor relay it: a
+            // member cannot close a pool); a member honors it only from the host.
+            if message.isPoolClosedEvent {
+                if !self.isHost, message.senderID == self.currentSession?.hostPeerID,
+                   self.isHostPeer(inboundPeerID) {
+                    self.endPoolAsMember(.hostClosed)
+                } else {
+                    log("[POOL_CLOSED] Ignoring pool-closed event from \(peerDisplayName): not the host", level: .warning, category: .network)
+                }
+                return
             }
 
             // Route system messages to mesh relay service for topology broadcast processing

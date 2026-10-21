@@ -103,6 +103,18 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     /// Callback for opening a game
     public var onOpenGame: ((MultiplayerGameType) -> Void)?
 
+    /// Called when the pool ended underneath this member (the host closed it, or the
+    /// connection was lost), after the pool UI has been reset. The hosting app uses it to
+    /// close the games and other pool apps that were running against the pool.
+    public var onPoolEnded: (() -> Void)?
+
+    /// Shows the "the pool ended" notice after a member's pool ended on its own.
+    @Published public var showPoolEndedNotice: Bool = false
+    /// The localized text of that notice.
+    @Published public private(set) var poolEndedMessage: String = ""
+    /// True while the host's "Close Pool" is announcing and flushing (prevents a second tap).
+    @Published public private(set) var isClosingPool: Bool = false
+
     // MARK: - Remote Pool Service
 
     /// Service for managing remote host identity, invitations, and QR codes.
@@ -419,6 +431,14 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             }
             .store(in: &cancellables)
 
+        // A member's pool ended underneath it (host closed it / connection lost).
+        poolManager.poolEnded
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] reason in
+                self?.handlePoolEnded(reason)
+            }
+            .store(in: &cancellables)
+
         // Subscribe to peer events
         poolManager.peerEvent
             .receive(on: DispatchQueue.main)
@@ -685,6 +705,46 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         }
 
         log("ConnectionPool disconnected by user action", category: .runtime)
+    }
+
+    /// Host: closes the pool for everyone. Announces `.poolClosed` (and `close_pool` on a
+    /// relay), waits a bounded moment for it to leave, then tears down. Members and
+    /// non-hosts use ``disconnect()``.
+    public func closePool() {
+        guard isHost else {
+            disconnect()
+            return
+        }
+        guard !isClosingPool else { return }
+        isClosingPool = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.poolManager.closePoolAsHost()
+            self.isClosingPool = false
+            self.disconnect()
+        }
+    }
+
+    /// A member's pool ended on its own: reset every piece of pool UI state, let the app
+    /// close games, and show the notice on the pool screen.
+    func handlePoolEnded(_ reason: ConnectionPoolManager.PoolEndReason) {
+        guard !isHost else { return }
+        log("Pool ended underneath this member (\(reason))", category: .network)
+        if transportMode == .remote {
+            // A closed pool is gone: also drop the saved identity and record.
+            leaveRemoteMemberPool()
+        } else {
+            disconnect()
+        }
+        // The notice must outlive disconnect()'s deferred reset, so it is set after it.
+        switch reason {
+        case .hostClosed:
+            poolEndedMessage = poolString("connectionpool.poolClosed.message", fallback: "The host closed the pool")
+        case .connectionLost:
+            poolEndedMessage = poolString("connectionpool.poolEnded.connectionLost", fallback: "The connection to the pool was lost")
+        }
+        showPoolEndedNotice = true
+        onPoolEnded?()
     }
 
     /// Called when this peer receives a `.removedFromPool` control signal from the host.
@@ -1351,6 +1411,9 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
                 // Control event: the host removed us from the pool. Honor it by leaving
                 // and surfacing a clear notice. Guard on targetPeerID so a stray/relayed
                 // removal aimed at another peer is never acted on by us.
+                // The pool-closed event is acted on by the manager; it is not chat text.
+                if payload.event == .poolClosed { return }
+
                 if payload.event == .removedFromPool,
                    payload.targetPeerID == nil || payload.targetPeerID == poolManager.localPeerID {
                     handleRemovedFromPool()
@@ -1622,7 +1685,7 @@ extension ConnectionPoolViewModel: TransportDelegate {
         // Decode as PoolMessage and inject into ConnectionPoolManager's pipeline.
         // This makes PoolChat and games receive the message.
         if let message = try? JSONDecoder().decode(PoolMessage.self, from: data) {
-            poolManager.injectReceivedMessage(message)
+            poolManager.injectReceivedMessage(message, from: peerID)
             handleReceivedMessage(message)
         }
     }
@@ -1679,6 +1742,12 @@ extension ConnectionPoolViewModel: TransportDelegate {
             // Claim was rejected by the server.
             isClaimingServer = false
             showError(message: "Claim rejected. Check that the claim code is correct and has not already been used.")
+        case .poolClosed:
+            // The relay told this guest the host closed the pool (`kicked` "pool closed").
+            // A host that is only offline never gets here: the relay keeps that pool alive.
+            if !isHost, transportMode == .remote {
+                handlePoolEnded(.hostClosed)
+            }
         case .hostOffline:
             // Relay v0.5.0+ rejection: the pool is alive but the host is offline and
             // can't approve new joins. Surface a friendly message and don't auto-retry —
