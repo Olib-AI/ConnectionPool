@@ -536,6 +536,32 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         disconnect()
     }
 
+    /// The relay's `kicked` reasons that mean the whole pool ended (`handle_close_pool`
+    /// sends "pool closed" to every guest; the host-offline TTL eviction sends
+    /// "pool_closed_host_offline"). Any other reason ("Removed by host",
+    /// "rejoined_elsewhere", ...) concerns this peer only.
+    static func isPoolClosedKickReason(_ reason: String) -> Bool {
+        reason == "pool closed" || reason == "pool_closed_host_offline"
+    }
+
+    /// Closes the pool on the relay and disconnects, giving the `close_pool` frame time
+    /// to leave the socket first (`stopAdvertising()` cancels the socket immediately, which
+    /// can drop it). The relay then sends every guest a `kicked` frame and removes the pool.
+    ///
+    /// Frames queued earlier on the same socket (the `.poolClosed` broadcast) are written
+    /// before it. The wait is bounded by `timeout`; the disconnect happens either way.
+    public func closePool(flushTimeout timeout: Duration = .milliseconds(500)) async {
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let timer = Task {
+            try? await Task.sleep(for: timeout)
+            continuation.finish()
+        }
+        sendFrame(.closePool(), completion: { continuation.finish() })
+        for await _ in stream {}
+        timer.cancel()
+        disconnect()
+    }
+
     /// Accept a pending join request from a peer.
     ///
     /// - Parameter peerID: The public key identifier of the requesting peer.
@@ -1004,12 +1030,13 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// before the socket. Used to prove the relay never receives the transport secret.
     var outboundFrameObserver: (@MainActor (Data) -> Void)?
 
-    private func sendFrame(_ frame: ServerFrame) {
+    private func sendFrame(_ frame: ServerFrame, completion: (@Sendable () -> Void)? = nil) {
         if let outboundFrameObserver, let data = try? injectSessionToken(into: frame).toJSON() {
             outboundFrameObserver(data)
         }
         guard let task = webSocketTask else {
             logMessage("sendFrame: webSocketTask is nil, dropping frame")
+            completion?()
             return
         }
 
@@ -1021,6 +1048,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             let text = String(data: data, encoding: .utf8) ?? ""
             let message = URLSessionWebSocketTask.Message.string(text)
             task.send(message) { [weak self] error in
+                completion?()
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if let error {
@@ -1030,6 +1058,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             }
         } catch {
             logMessage("Frame encoding error: \(error.localizedDescription)")
+            completion?()
         }
     }
 
@@ -1707,9 +1736,16 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         case .kicked(let data):
             logMessage("Kicked from pool: \(data.reason)")
             intentionalDisconnect = true
+            let poolEnded = Self.isPoolClosedKickReason(data.reason)
+            if poolEnded {
+                // The pool no longer exists on the relay: drop the saved identity and
+                // record so it is not rejoined (it would only answer pool_not_found).
+                purgeMemberStateForCurrentPool()
+            }
             tearDown()
-            updateState(.failed(.kicked))
-            delegate?.transport(self, didFailWithError: .kicked)
+            let error: TransportError = poolEnded ? .poolClosed : .kicked
+            updateState(.failed(error))
+            delegate?.transport(self, didFailWithError: error)
 
         case .heartbeatPong(let data):
             lastPongTimestamp = Date()

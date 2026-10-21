@@ -160,6 +160,11 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
     /// and saved record are stale and should be deleted.
     case poolNotFound
 
+    /// The host closed the pool (relay `kicked` with the close reason, sent to every
+    /// guest). The pool is gone: the member ends its session and the saved record is
+    /// deleted. A host that is merely offline never produces this.
+    case poolClosed
+
     /// An underlying system error occurred.
     case underlying(WrappedError)
 
@@ -177,6 +182,7 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
         case .hostOffline: return "The pool host is currently offline. Try again later."
         case .notApproved: return "Pool no longer available — your membership was revoked."
         case .poolNotFound: return "This pool no longer exists."
+        case .poolClosed: return "The host closed the pool."
         case .underlying(let wrapped): return "Error: \(wrapped.message)"
         }
     }
@@ -196,7 +202,8 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
              (.serverUnclaimed, .serverUnclaimed),
              (.hostOffline, .hostOffline),
              (.notApproved, .notApproved),
-             (.poolNotFound, .poolNotFound):
+             (.poolNotFound, .poolNotFound),
+             (.poolClosed, .poolClosed):
             return true
         case (.underlying(let a), .underlying(let b)):
             return a.message == b.message

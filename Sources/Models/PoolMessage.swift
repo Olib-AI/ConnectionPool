@@ -141,6 +141,24 @@ public struct PoolMessage: Identifiable, Codable, Sendable {
         )
     }
 
+    /// Create the host's "pool closed" broadcast (no target: every member acts on it).
+    public static func poolClosed(from senderID: String, senderName: String) -> PoolMessage {
+        let systemPayload = SystemPayload(text: "The host closed the pool.", event: .poolClosed)
+        let payloadData = (try? JSONEncoder().encode(systemPayload)) ?? Data()
+        return PoolMessage(
+            type: .system,
+            senderID: senderID,
+            senderName: senderName,
+            payload: payloadData,
+            isReliable: true
+        )
+    }
+
+    /// Whether this is a `.system` message carrying ``PoolSystemEvent/poolClosed``.
+    public var isPoolClosedEvent: Bool {
+        type == .system && decodePayload(as: SystemPayload.self)?.event == .poolClosed
+    }
+
     /// Create a key exchange message for E2E encryption
     public static func keyExchange(
         from senderID: String,
@@ -224,11 +242,17 @@ public struct ChatPayload: Codable, Sendable {
 ///
 /// Used for administrative signals that a peer must act on, as opposed to plain
 /// informational chat notices. New cases can be added without breaking older
-/// clients: an unknown raw value simply decodes as `nil` (the field is optional).
+/// clients: ``SystemPayload`` decodes an unknown raw value as `nil` instead of failing
+/// (synthesized `decodeIfPresent` would throw), so the message degrades to plain text.
+/// A 1.4.x client, whose enum predates the newer cases, fails to decode the payload
+/// and drops the message; it still leaves through its own host-loss path.
 public enum PoolSystemEvent: String, Codable, Sendable {
     /// The host removed the recipient from the pool. On receipt, the targeted peer
     /// leaves the pool (member-side `disconnect()`) and surfaces a notice.
     case removedFromPool = "removed_from_pool"
+    /// The host closed the pool. Broadcast to every member just before the host tears
+    /// the pool down; each member ends its session and shows a notice (1.5.0+).
+    case poolClosed = "pool_closed"
 }
 
 /// Payload for system messages.
@@ -247,6 +271,18 @@ public struct SystemPayload: Codable, Sendable {
         self.text = text
         self.event = event
         self.targetPeerID = targetPeerID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case text, event, targetPeerID
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.text = try container.decode(String.self, forKey: .text)
+        // An event this build does not know (a newer peer) decodes as `nil`.
+        self.event = (try? container.decodeIfPresent(PoolSystemEvent.self, forKey: .event)) ?? nil
+        self.targetPeerID = try container.decodeIfPresent(String.self, forKey: .targetPeerID)
     }
 }
 
